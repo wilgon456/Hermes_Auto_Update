@@ -1,0 +1,8 @@
+{
+  "repo_root": "/absolute/path/to/hermes-agent",
+  "hermes_home": "/absolute/path/to/.hermes/profiles/main",
+  "discord_channel_id": "1491641510867763200",
+  "remote": "origin",
+  "branch": "main",
+  "notify_on_no_update": false
+}
