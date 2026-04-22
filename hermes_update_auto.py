@@ -18,7 +18,7 @@ from urllib import error, request
 
 DEFAULT_REMOTE = "origin"
 DEFAULT_BRANCH = "main"
-DEFAULT_CHANNEL = "1491641510867763200"
+DEFAULT_CHANNEL = ""
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
 
@@ -224,7 +224,7 @@ def format_no_update(profile_name: str, status: UpdateStatus) -> str:
 def run_once(config: dict[str, Any]) -> int:
     repo_root = Path(config["repo_root"]).expanduser().resolve()
     hermes_home = Path(config["hermes_home"]).expanduser().resolve()
-    channel_id = str(config.get("discord_channel_id", DEFAULT_CHANNEL))
+    channel_id = str(config.get("discord_channel_id", DEFAULT_CHANNEL)).strip()
     remote = str(config.get("remote", DEFAULT_REMOTE))
     branch = str(config.get("branch", DEFAULT_BRANCH))
     notify_on_no_update = bool(config.get("notify_on_no_update", False))
@@ -232,6 +232,10 @@ def run_once(config: dict[str, Any]) -> int:
 
     env_values = load_simple_env(hermes_home / ".env")
     discord_token = env_values.get("DISCORD_BOT_TOKEN", "").strip()
+
+    if not channel_id:
+        print("discord_channel_id is missing in config.json", file=sys.stderr)
+        return 2
 
     if not discord_token:
         print("DISCORD_BOT_TOKEN is missing in the Hermes profile .env", file=sys.stderr)

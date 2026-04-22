@@ -28,7 +28,20 @@ Copy `config.example.json` to `config.json` and edit:
 {
   "repo_root": "/absolute/path/to/hermes-agent",
   "hermes_home": "/absolute/path/to/.hermes/profiles/main",
-  "discord_channel_id": "1491641510867763200",
+  "discord_channel_id": "YOUR_DISCORD_CHANNEL_ID",
+  "remote": "origin",
+  "branch": "main",
+  "notify_on_no_update": false
+}
+```
+
+Windows example:
+
+```json
+{
+  "repo_root": "C:\\Users\\you\\hermes-agent",
+  "hermes_home": "C:\\Users\\you\\.hermes\\profiles\\main",
+  "discord_channel_id": "YOUR_DISCORD_CHANNEL_ID",
   "remote": "origin",
   "branch": "main",
   "notify_on_no_update": false
