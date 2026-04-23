@@ -1,28 +1,29 @@
 # hermes update auto
 
-Standalone daily updater for a local `hermes-agent` git checkout.
+로컬 `hermes-agent` 체크아웃을 매일 점검해서 자동 업데이트하는 외부 업데이터입니다.
 
-What it does:
+## 주요 기능
 
-- checks `origin/main` once a day
-- does nothing when there is no new commit
-- runs `hermes update` automatically when updates exist
-- sends a Korean status message to a Discord channel
+- 매일 `origin/main`을 확인합니다.
+- 저장소 업데이트가 있으면 `hermes update`를 실행합니다.
+- Hermes 공식 스킬 업데이트와 커스텀 스킬 업데이트를 각각 on/off 할 수 있습니다.
+- `~/.hermes/skills` 아래의 수동 설치 스킬 중, 공개 소스에서 정확히 하나로 식별되는 경우 자동으로 추적 목록에 등록합니다.
+- 별도 manifest에 등록된 수동 설치 공개 스킬도 upstream 내용을 다시 확인해서 자동 갱신합니다.
+- 저장소와 공개 스킬 모두 변경이 없으면 아무 작업도 하지 않습니다.
+- 결과를 Discord 채널에 한국어 메시지로 전송합니다.
 
-It is intentionally external to Hermes scheduling. Self-updating is safer from
-`launchd` or Windows Task Scheduler than from an in-process Hermes cron job,
-because `hermes update` can restart services during the run.
+이 업데이터는 Hermes 내부 cron이 아니라 별도 스케줄러에서 돌리도록 설계했습니다. `hermes update` 실행 중 서비스 재시작이 일어날 수 있어서, `launchd`나 Windows Task Scheduler 같은 외부 스케줄러에서 돌리는 편이 더 안전합니다.
 
-## Requirements
+## 요구 사항
 
-- a local `hermes-agent` git checkout
-- a working Hermes profile with `.env`
-- `DISCORD_BOT_TOKEN` present in that Hermes profile `.env`
-- your Discord bot must be in the server and able to post to the target channel
+- 로컬에 `hermes-agent` 저장소가 있어야 합니다.
+- 정상 동작하는 Hermes 프로필과 `.env`가 있어야 합니다.
+- 해당 프로필 `.env`에 `DISCORD_BOT_TOKEN`이 있어야 합니다.
+- Discord 봇이 대상 서버에 들어가 있고, 대상 채널에 메시지를 쓸 수 있어야 합니다.
 
-## Config
+## 설정
 
-Copy `config.example.json` to `config.json` and edit:
+`config.example.json`을 `config.json`으로 복사한 뒤 수정합니다.
 
 ```json
 {
@@ -31,11 +32,15 @@ Copy `config.example.json` to `config.json` and edit:
   "discord_channel_id": "YOUR_DISCORD_CHANNEL_ID",
   "remote": "origin",
   "branch": "main",
+  "auto_update_official_skills": true,
+  "auto_update_custom_skills": true,
+  "auto_discover_manual_public_skills": true,
+  "tracked_public_skills_manifest": "/absolute/path/to/tracked-public-skills.json",
   "notify_on_no_update": false
 }
 ```
 
-Windows example:
+Windows 예시는 다음과 같습니다.
 
 ```json
 {
@@ -44,11 +49,79 @@ Windows example:
   "discord_channel_id": "YOUR_DISCORD_CHANNEL_ID",
   "remote": "origin",
   "branch": "main",
+  "auto_update_official_skills": true,
+  "auto_update_custom_skills": true,
+  "auto_discover_manual_public_skills": true,
+  "tracked_public_skills_manifest": "C:\\Users\\you\\hermes-update-auto\\tracked-public-skills.json",
   "notify_on_no_update": false
 }
 ```
 
-## Run Once
+설정 항목 설명:
+
+- `auto_update_official_skills`
+  Hermes 공식 스킬 자동 업데이트 여부입니다. 기본값은 `true`입니다.
+  source가 `official`인 hub-installed 공식 optional skill만 업데이트합니다.
+- `auto_update_custom_skills`
+  커스텀 스킬 자동 업데이트 여부입니다. 기본값은 `true`입니다.
+  source가 `official`이 아닌 hub-installed 스킬과 `tracked-public-skills.json`에 들어있는 수동 추적 스킬을 업데이트합니다.
+- `auto_discover_manual_public_skills`
+  수동 설치 공개 스킬 자동 발견 여부입니다. 기본값은 `true`입니다.
+  `auto_update_custom_skills`가 켜져 있을 때만 동작합니다.
+  `~/.hermes/skills`를 스캔해서 hub-installed 스킬과 bundled 스킬을 제외하고, upstream 검색 결과가 exact-name으로 정확히 1개일 때만 자동 등록합니다.
+- `tracked_public_skills_manifest`
+  수동 설치 공개 스킬 추적 파일 경로입니다. 생략하면 `config.json` 옆의 `tracked-public-skills.json`을 사용합니다.
+- `notify_on_no_update`
+  변경이 없어도 Discord에 `상태: 업데이트 없음` 메시지를 보낼지 결정합니다.
+
+## 수동 설치 공개 스킬 추적
+
+업데이터는 이 manifest를 자동으로 채울 수 있지만, identifier를 이미 알고 있다면 직접 넣어도 됩니다.
+
+예시 manifest:
+
+```json
+{
+  "version": 1,
+  "skills": [
+    {
+      "identifier": "skills-sh/example/repo/k-skill",
+      "name": "k-skill",
+      "category": "community",
+      "enabled": true
+    }
+  ]
+}
+```
+
+각 항목에서 지원하는 필드:
+
+- `identifier`: 필수, 공개 스킬 identifier
+- `name`: 선택, 표시용 이름
+- `category`: 선택, `~/.hermes/skills` 아래 설치 카테고리
+- `install_path`: 선택, 상대 설치 경로. 지정하면 `category/name`보다 우선합니다.
+- `enabled`: 선택, 기본값은 `true`
+
+매 실행마다 이 manifest에 등록된 스킬의 upstream bundle을 다시 확인합니다. 원격 hash와 현재 로컬 설치본 hash가 다르면 아래 명령으로 다시 설치합니다.
+
+```bash
+hermes skills install <identifier> --force --yes
+```
+
+그리고 manifest의 `state` 블록에 마지막 확인 시각, 마지막 적용 hash, probe 상태 등을 기록합니다.
+
+## 자동 발견 규칙
+
+수동 설치 스킬을 무조건 자동 등록하지는 않습니다. 오탐을 줄이기 위해 아래 조건을 모두 만족할 때만 등록합니다.
+
+- 현재 `hub-installed` 스킬이 아닐 것
+- bundled skill이 아닐 것
+- 이미 `tracked-public-skills.json`에 등록된 스킬이 아닐 것
+- upstream 검색 결과에서 exact-name 일치 후보가 정확히 1개일 것
+
+이 조건을 만족하지 못하면 자동 등록하지 않습니다. 이런 경우에는 manifest에 직접 추가해야 합니다.
+
+## 1회 실행
 
 macOS / Linux:
 
@@ -64,13 +137,13 @@ py -3 .\hermes_update_auto.py --config .\config.json
 
 ## macOS launchd
 
-Install a daily job for `09:00`:
+매일 `09:00`에 실행되도록 설치:
 
 ```bash
 zsh install_macos_launchd.sh 9 0
 ```
 
-This writes:
+다음 파일이 생성됩니다.
 
 - `~/Library/LaunchAgents/ai.hermes.daily-repo-update.plist`
 - `daily-update.stdout.log`
@@ -78,22 +151,32 @@ This writes:
 
 ## Windows Task Scheduler
 
-Install a daily task for `09:00`:
+매일 `09:00`에 실행되도록 설치:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_windows_task.ps1 -Time 09:00
 ```
 
-This creates a scheduled task named `HermesDailyRepoUpdate`.
+`HermesDailyRepoUpdate`라는 예약 작업이 생성됩니다.
 
-## Discord message format
+## Discord 메시지 형식
 
-The updater sends Korean status values:
+업데이터는 아래 상태값을 사용합니다.
 
 - `상태: 업데이트 성공`
 - `상태: 업데이트 실패`
 - `상태: 업데이트 확인 실패`
 
-If `notify_on_no_update` is `true`, it also sends:
+`notify_on_no_update`가 `true`면 아래 상태도 전송합니다.
 
 - `상태: 업데이트 없음`
+
+성공 메시지에는 다음 정보가 함께 들어갑니다.
+
+- 반영된 repo 커밋 수
+- 반영된 공개 스킬 수
+
+여기서 공개 스킬 수에는 다음이 포함됩니다.
+
+- `hermes skills update`로 갱신된 hub-installed 공개 스킬
+- `tracked-public-skills.json`에 자동 발견되었거나 수동 등록된 공개 스킬

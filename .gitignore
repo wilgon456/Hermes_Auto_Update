@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 config.json
+tracked-public-skills.json
+daily-update.stdout.log
+daily-update.stderr.log

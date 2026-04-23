@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "identifier": "skills-sh/example/repo/k-skill",
+      "name": "k-skill",
+      "category": "community",
+      "enabled": true
+    }
+  ]
+}

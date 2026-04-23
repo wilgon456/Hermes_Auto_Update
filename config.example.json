@@ -4,5 +4,9 @@
   "discord_channel_id": "YOUR_DISCORD_CHANNEL_ID",
   "remote": "origin",
   "branch": "main",
+  "auto_update_official_skills": true,
+  "auto_update_custom_skills": true,
+  "auto_discover_manual_public_skills": true,
+  "tracked_public_skills_manifest": "/absolute/path/to/tracked-public-skills.json",
   "notify_on_no_update": false
 }
