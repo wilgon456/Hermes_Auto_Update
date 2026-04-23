@@ -7,6 +7,8 @@
   "auto_update_official_skills": true,
   "auto_update_custom_skills": true,
   "auto_discover_manual_public_skills": true,
+  "defer_if_recent_gateway_activity": true,
+  "recent_session_window_seconds": 120,
   "tracked_public_skills_manifest": "/absolute/path/to/tracked-public-skills.json",
   "notify_on_no_update": false
 }

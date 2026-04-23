@@ -9,6 +9,8 @@
 - Hermes 공식 스킬 업데이트와 커스텀 스킬 업데이트를 각각 on/off 할 수 있습니다.
 - `~/.hermes/skills` 아래의 수동 설치 스킬 중, 공개 소스에서 정확히 하나로 식별되는 경우 자동으로 추적 목록에 등록합니다.
 - 별도 manifest에 등록된 수동 설치 공개 스킬도 upstream 내용을 다시 확인해서 자동 갱신합니다.
+- 같은 repo/profile 조합에 대해 중복 실행이 감지되면 새 실행은 바로 종료합니다.
+- gateway가 최근에 활동 중인 것으로 보이면 업데이트를 보류합니다.
 - 저장소와 공개 스킬 모두 변경이 없으면 아무 작업도 하지 않습니다.
 - 결과를 Discord 채널에 한국어 메시지로 전송합니다.
 
@@ -35,6 +37,8 @@
   "auto_update_official_skills": true,
   "auto_update_custom_skills": true,
   "auto_discover_manual_public_skills": true,
+  "defer_if_recent_gateway_activity": true,
+  "recent_session_window_seconds": 120,
   "tracked_public_skills_manifest": "/absolute/path/to/tracked-public-skills.json",
   "notify_on_no_update": false
 }
@@ -52,6 +56,8 @@ Windows 예시는 다음과 같습니다.
   "auto_update_official_skills": true,
   "auto_update_custom_skills": true,
   "auto_discover_manual_public_skills": true,
+  "defer_if_recent_gateway_activity": true,
+  "recent_session_window_seconds": 120,
   "tracked_public_skills_manifest": "C:\\Users\\you\\hermes-update-auto\\tracked-public-skills.json",
   "notify_on_no_update": false
 }
@@ -71,6 +77,12 @@ Windows 예시는 다음과 같습니다.
   `~/.hermes/skills`를 스캔해서 hub-installed 스킬과 bundled 스킬을 제외하고, upstream 검색 결과가 exact-name으로 정확히 1개일 때만 자동 등록합니다.
 - `tracked_public_skills_manifest`
   수동 설치 공개 스킬 추적 파일 경로입니다. 생략하면 `config.json` 옆의 `tracked-public-skills.json`을 사용합니다.
+- `defer_if_recent_gateway_activity`
+  기본값은 `true`입니다.
+  Hermes gateway 상태 파일과 session index를 보고 최근 활동이 감지되면 이번 실행의 업데이트를 보류합니다.
+- `recent_session_window_seconds`
+  기본값은 `120`초입니다.
+  최근 session activity로 간주할 시간 창입니다.
 - `notify_on_no_update`
   변경이 없어도 Discord에 `상태: 업데이트 없음` 메시지를 보낼지 결정합니다.
 
@@ -166,6 +178,7 @@ powershell -ExecutionPolicy Bypass -File .\install_windows_task.ps1 -Time 09:00
 - `상태: 업데이트 성공`
 - `상태: 업데이트 실패`
 - `상태: 업데이트 확인 실패`
+- `상태: 업데이트 보류`
 
 `notify_on_no_update`가 `true`면 아래 상태도 전송합니다.
 

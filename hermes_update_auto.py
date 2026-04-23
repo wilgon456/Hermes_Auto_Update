@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -11,10 +12,15 @@ import socket
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error, request
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 DEFAULT_REMOTE = "origin"
@@ -25,6 +31,11 @@ DEFAULT_MANUAL_SKILLS_MANIFEST = "tracked-public-skills.json"
 DEFAULT_AUTO_UPDATE_OFFICIAL_SKILLS = True
 DEFAULT_AUTO_UPDATE_CUSTOM_SKILLS = True
 DEFAULT_AUTO_DISCOVER_MANUAL_PUBLIC_SKILLS = True
+DEFAULT_DEFER_IF_RECENT_GATEWAY_ACTIVITY = True
+DEFAULT_RECENT_SESSION_WINDOW_SECONDS = 120
+DEFAULT_GATEWAY_RUNTIME_STATUS_FILE = "gateway_state.json"
+DEFAULT_GATEWAY_SESSIONS_DIR = "sessions"
+DEFAULT_GATEWAY_SESSIONS_INDEX = "sessions.json"
 _MANUAL_UPDATED_RE = re.compile(r"Installed:\s*(.+?)\s*$", re.IGNORECASE)
 
 
@@ -74,6 +85,24 @@ class HubSkillCandidate:
     install_path: str
 
 
+@dataclass
+class GatewayActivityStatus:
+    profile_name: str
+    hermes_home: Path
+    pid: int
+    pid_running: bool
+    gateway_state: str
+    restart_requested: bool
+    active_agents: int
+    recent_session_count: int
+    runtime_updated_at: str
+    recent_session_updated_at: str
+
+
+class AlreadyRunningError(RuntimeError):
+    """Raised when another updater instance already holds the run lock."""
+
+
 def _now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
@@ -105,6 +134,207 @@ def load_config(path: Path) -> dict[str, Any]:
 def save_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def read_json_file(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def build_lock_path(config: dict[str, Any]) -> Path:
+    config_path = Path(config.get("_config_path", __file__)).expanduser().resolve()
+    repo_root = Path(config["repo_root"]).expanduser().resolve()
+    hermes_home = Path(config["hermes_home"]).expanduser().resolve()
+    scope = f"{repo_root}\n{hermes_home}"
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
+    return config_path.with_name(f".hermes-update-auto.{digest}.lock")
+
+
+def acquire_run_lock(lock_path: Path) -> Any:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    try:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write("\n")
+            lock_file.flush()
+        lock_file.seek(0)
+
+        if os.name == "nt":
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        lock_file.seek(0)
+        holder = lock_file.read().strip()
+        lock_file.close()
+        detail = f" Holder: {holder}" if holder else ""
+        raise AlreadyRunningError(
+            f"Another hermes-update-auto process is already running for this repo/profile."
+            f" Lock: {lock_path}.{detail}"
+        ) from exc
+
+    metadata = {
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "started_at_utc": _now_utc(),
+    }
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(json.dumps(metadata, ensure_ascii=False) + "\n")
+    lock_file.flush()
+    return lock_file
+
+
+def release_run_lock(lock_file: Any) -> None:
+    try:
+        if os.name == "nt":
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def iter_hermes_homes(hermes_home: Path) -> list[Path]:
+    candidates: list[Path] = []
+    if hermes_home.parent.name == "profiles":
+        candidates.extend(path for path in hermes_home.parent.iterdir() if path.is_dir())
+    else:
+        candidates.append(hermes_home)
+        profiles_dir = hermes_home / "profiles"
+        if profiles_dir.is_dir():
+            candidates.extend(path for path in profiles_dir.iterdir() if path.is_dir())
+
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for path in [hermes_home, *candidates]:
+        resolved = path.expanduser().resolve()
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        ordered.append(resolved)
+    return ordered
+
+
+def load_recent_gateway_activity(
+    hermes_home: Path,
+    *,
+    session_window_seconds: int,
+) -> GatewayActivityStatus | None:
+    runtime_path = hermes_home / DEFAULT_GATEWAY_RUNTIME_STATUS_FILE
+    try:
+        runtime_payload = read_json_file(runtime_path)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(runtime_payload, dict):
+        return None
+
+    pid = _safe_int(runtime_payload.get("pid", 0) or 0)
+    pid_running = _pid_is_running(pid)
+    if not pid_running:
+        return None
+
+    gateway_state = str(runtime_payload.get("gateway_state", "")).strip()
+    restart_requested = bool(runtime_payload.get("restart_requested", False))
+    active_agents = _safe_int(runtime_payload.get("active_agents", 0) or 0)
+    runtime_updated_at = str(runtime_payload.get("updated_at", "")).strip()
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=max(0, session_window_seconds))
+    recent_session_count = 0
+    recent_session_updated_at = ""
+    sessions_index_path = hermes_home / DEFAULT_GATEWAY_SESSIONS_DIR / DEFAULT_GATEWAY_SESSIONS_INDEX
+    try:
+        sessions_payload = read_json_file(sessions_index_path)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        sessions_payload = {}
+
+    if isinstance(sessions_payload, dict):
+        newest: datetime | None = None
+        for entry in sessions_payload.values():
+            if not isinstance(entry, dict):
+                continue
+            updated_at = _parse_iso_datetime(str(entry.get("updated_at", "")))
+            if updated_at is None or updated_at < cutoff:
+                continue
+            if bool(entry.get("suspended", False)):
+                continue
+            recent_session_count += 1
+            if newest is None or updated_at > newest:
+                newest = updated_at
+        if newest is not None:
+            recent_session_updated_at = newest.strftime("%Y-%m-%d %H:%M:%SZ")
+
+    if active_agents <= 0 and recent_session_count <= 0:
+        return None
+
+    profile_name = hermes_home.name if hermes_home.name != ".hermes" else "default"
+    return GatewayActivityStatus(
+        profile_name=profile_name,
+        hermes_home=hermes_home,
+        pid=pid,
+        pid_running=pid_running,
+        gateway_state=gateway_state,
+        restart_requested=restart_requested,
+        active_agents=active_agents,
+        recent_session_count=recent_session_count,
+        runtime_updated_at=runtime_updated_at,
+        recent_session_updated_at=recent_session_updated_at,
+    )
+
+
+def detect_recent_gateway_activity(
+    hermes_home: Path,
+    *,
+    session_window_seconds: int,
+) -> list[GatewayActivityStatus]:
+    blockers: list[GatewayActivityStatus] = []
+    for candidate in iter_hermes_homes(hermes_home):
+        status = load_recent_gateway_activity(
+            candidate,
+            session_window_seconds=session_window_seconds,
+        )
+        if status is None:
+            continue
+        blockers.append(status)
+    return blockers
 
 
 def run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -955,6 +1185,38 @@ def format_check_failure(profile_name: str, output: str) -> str:
     )
 
 
+def format_update_deferred(
+    profile_name: str,
+    blockers: list[GatewayActivityStatus],
+    *,
+    session_window_seconds: int,
+) -> str:
+    lines = [
+        "Hermes 일일 자동 업데이트 결과",
+        "상태: 업데이트 보류",
+        f"프로필: {profile_name}",
+        f"호스트: {socket.gethostname()}",
+        f"시각(UTC): {_now_utc()}",
+        f"보류 기준: 최근 {session_window_seconds}초 내 gateway 활동",
+        "",
+        "감지된 활동:",
+    ]
+    for status in blockers:
+        details: list[str] = [f"profile={status.profile_name}", f"pid={status.pid}"]
+        if status.active_agents > 0:
+            details.append(f"active_agents={status.active_agents}")
+        if status.recent_session_count > 0:
+            details.append(f"recent_sessions={status.recent_session_count}")
+        if status.gateway_state:
+            details.append(f"state={status.gateway_state}")
+        if status.runtime_updated_at:
+            details.append(f"runtime_updated_at={status.runtime_updated_at}")
+        if status.recent_session_updated_at:
+            details.append(f"recent_session_at={status.recent_session_updated_at}")
+        lines.append(f"- {', '.join(details)}")
+    return "\n".join(lines)
+
+
 def format_no_update(profile_name: str, status: UpdateStatus, *, skill_updates_checked: bool) -> str:
     lines = [
         "Hermes 일일 자동 업데이트 결과",
@@ -976,6 +1238,22 @@ def run_once(config: dict[str, Any]) -> int:
     remote = str(config.get("remote", DEFAULT_REMOTE))
     branch = str(config.get("branch", DEFAULT_BRANCH))
     notify_on_no_update = bool(config.get("notify_on_no_update", False))
+    defer_if_recent_gateway_activity = bool(
+        config.get(
+            "defer_if_recent_gateway_activity",
+            DEFAULT_DEFER_IF_RECENT_GATEWAY_ACTIVITY,
+        )
+    )
+    recent_session_window_seconds = max(
+        0,
+        _safe_int(
+            config.get(
+                "recent_session_window_seconds",
+                DEFAULT_RECENT_SESSION_WINDOW_SECONDS,
+            )
+            or 0
+        ),
+    )
     auto_update_official_skills = resolve_update_toggle(
         config,
         "auto_update_official_skills",
@@ -1008,6 +1286,27 @@ def run_once(config: dict[str, Any]) -> int:
     if not discord_token:
         print("DISCORD_BOT_TOKEN is missing in the Hermes profile .env", file=sys.stderr)
         return 2
+
+    if defer_if_recent_gateway_activity and recent_session_window_seconds > 0:
+        blockers = detect_recent_gateway_activity(
+            hermes_home,
+            session_window_seconds=recent_session_window_seconds,
+        )
+        if blockers:
+            message = format_update_deferred(
+                profile_name,
+                blockers,
+                session_window_seconds=recent_session_window_seconds,
+            )
+            send_discord_message(channel_id, discord_token, message)
+            print(
+                "Deferred update due to recent gateway activity: "
+                + ", ".join(
+                    f"{status.profile_name}(agents={status.active_agents}, sessions={status.recent_session_count})"
+                    for status in blockers
+                )
+            )
+            return 0
 
     try:
         status_before = collect_update_status(repo_root, remote=remote, branch=branch)
@@ -1166,7 +1465,18 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = load_config(args.config)
     config["_config_path"] = str(args.config.expanduser().resolve())
-    return run_once(config)
+    lock_path = build_lock_path(config)
+
+    try:
+        lock_file = acquire_run_lock(lock_path)
+    except AlreadyRunningError as exc:
+        print(str(exc), file=sys.stderr)
+        return 0
+
+    try:
+        return run_once(config)
+    finally:
+        release_run_lock(lock_file)
 
 
 if __name__ == "__main__":
