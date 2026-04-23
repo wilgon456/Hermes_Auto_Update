@@ -23,6 +23,19 @@
 - 해당 프로필 `.env`에 `DISCORD_BOT_TOKEN`이 있어야 합니다.
 - Discord 봇이 대상 서버에 들어가 있고, 대상 채널에 메시지를 쓸 수 있어야 합니다.
 
+## 지원 환경
+
+- macOS: `launchd` 설치 스크립트 제공
+- Windows: Task Scheduler 설치 스크립트 제공
+- Linux: 실행 자체는 가능하지만 전용 설치 스크립트는 아직 없으므로 cron/systemd timer는 수동 구성 기준입니다.
+
+## 공개 전 주의사항
+
+- 이 도구는 `hermes update`를 호출하므로, 실제 업데이트 시 Hermes gateway 재시작이나 manual gateway 종료가 일어날 수 있습니다.
+- 현재 기본 동작은 최근 gateway 활동이 감지되면 업데이트를 보류하는 것입니다.
+- 다만 이 보류 판단은 `gateway_state.json`과 `sessions/sessions.json` 기준이라, 아주 긴 작업을 100% 완벽하게 감지하는 것은 아닙니다.
+- 공개 저장소에는 실제 `config.json`, 프로필 `.env`, Discord 토큰 같은 비밀값을 포함하면 안 됩니다.
+
 ## 설정
 
 `config.example.json`을 `config.json`으로 복사한 뒤 수정합니다.
@@ -146,6 +159,10 @@ Windows:
 ```powershell
 py -3 .\hermes_update_auto.py --config .\config.json
 ```
+
+## 릴리즈
+
+- 현재 공개 태그: `v0.1.0`
 
 ## macOS launchd
 
