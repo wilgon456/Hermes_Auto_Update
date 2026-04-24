@@ -32,10 +32,12 @@ DEFAULT_AUTO_UPDATE_OFFICIAL_SKILLS = True
 DEFAULT_AUTO_UPDATE_CUSTOM_SKILLS = True
 DEFAULT_AUTO_DISCOVER_MANUAL_PUBLIC_SKILLS = True
 DEFAULT_DEFER_IF_RECENT_GATEWAY_ACTIVITY = True
+DEFAULT_DEFER_IF_REPO_DIRTY = True
 DEFAULT_RECENT_SESSION_WINDOW_SECONDS = 120
 DEFAULT_GATEWAY_RUNTIME_STATUS_FILE = "gateway_state.json"
 DEFAULT_GATEWAY_SESSIONS_DIR = "sessions"
 DEFAULT_GATEWAY_SESSIONS_INDEX = "sessions.json"
+BUSY_GATEWAY_STATES = {"starting", "draining", "stopping", "restarting"}
 _MANUAL_UPDATED_RE = re.compile(r"Installed:\s*(.+?)\s*$", re.IGNORECASE)
 
 
@@ -95,8 +97,16 @@ class GatewayActivityStatus:
     restart_requested: bool
     active_agents: int
     recent_session_count: int
+    recently_updated_platforms: list[str]
+    blocker_reasons: list[str]
     runtime_updated_at: str
     recent_session_updated_at: str
+
+
+@dataclass
+class WorktreeStatus:
+    dirty: bool
+    lines: list[str]
 
 
 class AlreadyRunningError(RuntimeError):
@@ -272,6 +282,7 @@ def load_recent_gateway_activity(
         return None
 
     gateway_state = str(runtime_payload.get("gateway_state", "")).strip()
+    normalized_gateway_state = gateway_state.lower()
     restart_requested = bool(runtime_payload.get("restart_requested", False))
     active_agents = _safe_int(runtime_payload.get("active_agents", 0) or 0)
     runtime_updated_at = str(runtime_payload.get("updated_at", "")).strip()
@@ -302,7 +313,30 @@ def load_recent_gateway_activity(
         if newest is not None:
             recent_session_updated_at = newest.strftime("%Y-%m-%d %H:%M:%SZ")
 
-    if active_agents <= 0 and recent_session_count <= 0:
+    recently_updated_platforms: list[str] = []
+    platforms = runtime_payload.get("platforms", {})
+    if isinstance(platforms, dict):
+        for name, payload in platforms.items():
+            if not isinstance(payload, dict):
+                continue
+            state = str(payload.get("state", "")).strip().lower()
+            updated_at = _parse_iso_datetime(str(payload.get("updated_at", "")))
+            if state == "connected" and updated_at is not None and updated_at >= cutoff:
+                recently_updated_platforms.append(str(name))
+
+    blocker_reasons: list[str] = []
+    if active_agents > 0:
+        blocker_reasons.append("active_agents")
+    if recent_session_count > 0:
+        blocker_reasons.append("recent_sessions")
+    if recently_updated_platforms:
+        blocker_reasons.append("recent_platform_activity")
+    if restart_requested:
+        blocker_reasons.append("restart_requested")
+    if normalized_gateway_state in BUSY_GATEWAY_STATES:
+        blocker_reasons.append(f"gateway_state={normalized_gateway_state}")
+
+    if not blocker_reasons:
         return None
 
     profile_name = hermes_home.name if hermes_home.name != ".hermes" else "default"
@@ -315,6 +349,8 @@ def load_recent_gateway_activity(
         restart_requested=restart_requested,
         active_agents=active_agents,
         recent_session_count=recent_session_count,
+        recently_updated_platforms=recently_updated_platforms,
+        blocker_reasons=blocker_reasons,
         runtime_updated_at=runtime_updated_at,
         recent_session_updated_at=recent_session_updated_at,
     )
@@ -345,6 +381,12 @@ def run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         check=True,
     )
+
+
+def collect_worktree_status(repo_root: Path) -> WorktreeStatus:
+    proc = run_git(repo_root, "status", "--porcelain", "--untracked-files=no")
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    return WorktreeStatus(dirty=bool(lines), lines=lines)
 
 
 def collect_update_status(
@@ -1203,10 +1245,16 @@ def format_update_deferred(
     ]
     for status in blockers:
         details: list[str] = [f"profile={status.profile_name}", f"pid={status.pid}"]
+        if status.blocker_reasons:
+            details.append(f"reasons={','.join(status.blocker_reasons)}")
         if status.active_agents > 0:
             details.append(f"active_agents={status.active_agents}")
         if status.recent_session_count > 0:
             details.append(f"recent_sessions={status.recent_session_count}")
+        if status.recently_updated_platforms:
+            details.append(f"recent_platforms={','.join(status.recently_updated_platforms)}")
+        if status.restart_requested:
+            details.append("restart_requested=true")
         if status.gateway_state:
             details.append(f"state={status.gateway_state}")
         if status.runtime_updated_at:
@@ -1214,6 +1262,23 @@ def format_update_deferred(
         if status.recent_session_updated_at:
             details.append(f"recent_session_at={status.recent_session_updated_at}")
         lines.append(f"- {', '.join(details)}")
+    return "\n".join(lines)
+
+
+def format_worktree_deferred(profile_name: str, worktree_status: WorktreeStatus) -> str:
+    lines = [
+        "Hermes 일일 자동 업데이트 결과",
+        "상태: 업데이트 보류",
+        f"프로필: {profile_name}",
+        f"호스트: {socket.gethostname()}",
+        f"시각(UTC): {_now_utc()}",
+        "보류 기준: hermes-agent 워크트리에 추적된 로컬 변경이 있음",
+        "",
+        "감지된 변경:",
+    ]
+    lines.extend(f"- {line}" for line in worktree_status.lines[:10])
+    if len(worktree_status.lines) > 10:
+        lines.append(f"- ... 외 {len(worktree_status.lines) - 10}개")
     return "\n".join(lines)
 
 
@@ -1244,6 +1309,7 @@ def run_once(config: dict[str, Any]) -> int:
             DEFAULT_DEFER_IF_RECENT_GATEWAY_ACTIVITY,
         )
     )
+    defer_if_repo_dirty = bool(config.get("defer_if_repo_dirty", DEFAULT_DEFER_IF_REPO_DIRTY))
     recent_session_window_seconds = max(
         0,
         _safe_int(
@@ -1286,6 +1352,26 @@ def run_once(config: dict[str, Any]) -> int:
     if not discord_token:
         print("DISCORD_BOT_TOKEN is missing in the Hermes profile .env", file=sys.stderr)
         return 2
+
+    if defer_if_repo_dirty:
+        try:
+            worktree_status = collect_worktree_status(repo_root)
+        except subprocess.CalledProcessError as exc:
+            output = "\n".join(filter(None, [exc.stdout, exc.stderr])) or str(exc)
+            send_discord_message(channel_id, discord_token, format_check_failure(profile_name, output))
+            print(output, file=sys.stderr)
+            return 1
+        if worktree_status.dirty:
+            send_discord_message(
+                channel_id,
+                discord_token,
+                format_worktree_deferred(profile_name, worktree_status),
+            )
+            print(
+                "Deferred update because hermes-agent has tracked local changes: "
+                + "; ".join(worktree_status.lines[:5])
+            )
+            return 0
 
     if defer_if_recent_gateway_activity and recent_session_window_seconds > 0:
         blockers = detect_recent_gateway_activity(

@@ -10,6 +10,7 @@
 - `~/.hermes/skills` 아래의 수동 설치 스킬 중, 공개 소스에서 정확히 하나로 식별되는 경우 자동으로 추적 목록에 등록합니다.
 - 별도 manifest에 등록된 수동 설치 공개 스킬도 upstream 내용을 다시 확인해서 자동 갱신합니다.
 - 같은 repo/profile 조합에 대해 중복 실행이 감지되면 새 실행은 바로 종료합니다.
+- `hermes-agent` 워크트리에 추적된 로컬 변경이 있으면 업데이트를 보류합니다.
 - gateway가 최근에 활동 중인 것으로 보이면 업데이트를 보류합니다.
 - 저장소와 공개 스킬 모두 변경이 없으면 아무 작업도 하지 않습니다.
 - 결과를 Discord 채널에 한국어 메시지로 전송합니다.
@@ -32,8 +33,9 @@
 ## 공개 전 주의사항
 
 - 이 도구는 `hermes update`를 호출하므로, 실제 업데이트 시 Hermes gateway 재시작이나 manual gateway 종료가 일어날 수 있습니다.
-- 현재 기본 동작은 최근 gateway 활동이 감지되면 업데이트를 보류하는 것입니다.
-- 다만 이 보류 판단은 `gateway_state.json`과 `sessions/sessions.json` 기준이라, 아주 긴 작업을 100% 완벽하게 감지하는 것은 아닙니다.
+- 현재 기본 동작은 추적된 로컬 변경이나 최근 gateway 활동이 감지되면 업데이트를 보류하는 것입니다.
+- gateway 보류 판단은 `gateway_state.json`, 플랫폼 상태, `sessions/sessions.json` 기준입니다.
+- `hermes-agent`에 추적된 로컬 변경이 있으면 충돌을 피하기 위해 `hermes update`를 호출하지 않습니다.
 - 공개 저장소에는 실제 `config.json`, 프로필 `.env`, Discord 토큰 같은 비밀값을 포함하면 안 됩니다.
 
 ## 설정
@@ -50,6 +52,7 @@
   "auto_update_official_skills": true,
   "auto_update_custom_skills": true,
   "auto_discover_manual_public_skills": true,
+  "defer_if_repo_dirty": true,
   "defer_if_recent_gateway_activity": true,
   "recent_session_window_seconds": 120,
   "tracked_public_skills_manifest": "/absolute/path/to/tracked-public-skills.json",
@@ -69,6 +72,7 @@ Windows 예시는 다음과 같습니다.
   "auto_update_official_skills": true,
   "auto_update_custom_skills": true,
   "auto_discover_manual_public_skills": true,
+  "defer_if_repo_dirty": true,
   "defer_if_recent_gateway_activity": true,
   "recent_session_window_seconds": 120,
   "tracked_public_skills_manifest": "C:\\Users\\you\\hermes-update-auto\\tracked-public-skills.json",
@@ -90,9 +94,14 @@ Windows 예시는 다음과 같습니다.
   `~/.hermes/skills`를 스캔해서 hub-installed 스킬과 bundled 스킬을 제외하고, upstream 검색 결과가 exact-name으로 정확히 1개일 때만 자동 등록합니다.
 - `tracked_public_skills_manifest`
   수동 설치 공개 스킬 추적 파일 경로입니다. 생략하면 `config.json` 옆의 `tracked-public-skills.json`을 사용합니다.
+- `defer_if_repo_dirty`
+  기본값은 `true`입니다.
+  `hermes-agent` 워크트리에 추적된 로컬 변경이 있으면 업데이트를 보류합니다.
+  untracked 파일은 보류 기준에서 제외합니다.
 - `defer_if_recent_gateway_activity`
   기본값은 `true`입니다.
-  Hermes gateway 상태 파일과 session index를 보고 최근 활동이 감지되면 이번 실행의 업데이트를 보류합니다.
+  Hermes gateway 상태 파일, platform update timestamp, session index를 보고 최근 활동이 감지되면 이번 실행의 업데이트를 보류합니다.
+  `active_agents`, 최근 session, 최근 connected platform activity, `restart_requested`, `starting`/`draining`/`stopping`/`restarting` 상태를 보류 신호로 봅니다.
 - `recent_session_window_seconds`
   기본값은 `120`초입니다.
   최근 session activity로 간주할 시간 창입니다.

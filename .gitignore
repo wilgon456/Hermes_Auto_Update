@@ -5,3 +5,4 @@ config.json
 tracked-public-skills.json
 daily-update.stdout.log
 daily-update.stderr.log
+.hermes-update-auto.*.lock
