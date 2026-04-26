@@ -490,6 +490,9 @@ def run_update(repo_root: Path, hermes_home: Path) -> subprocess.CompletedProces
 
 
 def send_discord_message(channel_id: str, token: str, message: str) -> None:
+    if not token:
+        print("Discord notification skipped: token missing", file=sys.stderr)
+        return
     payload = json.dumps({"content": message}).encode("utf-8")
     req = request.Request(
         f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
@@ -1343,15 +1346,22 @@ def run_once(config: dict[str, Any]) -> int:
     profile_name = hermes_home.name if hermes_home.name != ".hermes" else "default"
 
     env_values = load_simple_env(hermes_home / ".env")
-    discord_token = env_values.get("DISCORD_BOT_TOKEN", "").strip()
+    discord_token = (
+        os.environ.get("DISCORD_BOT_TOKEN")
+        or os.environ.get("DISCORD_TOKEN")
+        or env_values.get("DISCORD_BOT_TOKEN", "")
+        or env_values.get("DISCORD_TOKEN", "")
+    ).strip()
 
     if not channel_id:
         print("discord_channel_id is missing in config.json", file=sys.stderr)
         return 2
 
     if not discord_token:
-        print("DISCORD_BOT_TOKEN is missing in the Hermes profile .env", file=sys.stderr)
-        return 2
+        print(
+            "DISCORD_BOT_TOKEN/DISCORD_TOKEN is missing; Discord notifications will be skipped",
+            file=sys.stderr,
+        )
 
     if defer_if_repo_dirty:
         try:
