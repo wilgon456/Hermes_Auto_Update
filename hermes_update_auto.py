@@ -206,7 +206,7 @@ def release_run_lock(lock_file: Any) -> None:
         lock_file.close()
 
 
-def _parse_iso_datetime(value: str) -> datetime | None:
+def _parse_iso_datetime(value: str, *, naive_tz: timezone | None = timezone.utc) -> datetime | None:
     text = value.strip()
     if not text:
         return None
@@ -216,9 +216,14 @@ def _parse_iso_datetime(value: str) -> datetime | None:
         parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    try:
+        if parsed.tzinfo is None:
+            if naive_tz is None:
+                return parsed.astimezone(timezone.utc)
+            return parsed.replace(tzinfo=naive_tz).astimezone(timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -302,7 +307,7 @@ def load_recent_gateway_activity(
         for entry in sessions_payload.values():
             if not isinstance(entry, dict):
                 continue
-            updated_at = _parse_iso_datetime(str(entry.get("updated_at", "")))
+            updated_at = _parse_iso_datetime(str(entry.get("updated_at", "")), naive_tz=None)
             if updated_at is None or updated_at < cutoff:
                 continue
             if bool(entry.get("suspended", False)):
