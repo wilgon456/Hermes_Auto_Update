@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -33,10 +34,12 @@ DEFAULT_AUTO_UPDATE_CUSTOM_SKILLS = True
 DEFAULT_AUTO_DISCOVER_MANUAL_PUBLIC_SKILLS = True
 DEFAULT_DEFER_IF_RECENT_GATEWAY_ACTIVITY = True
 DEFAULT_DEFER_IF_REPO_DIRTY = True
+DEFAULT_DEFER_IF_LOCAL_COMMITS = True
 DEFAULT_RECENT_SESSION_WINDOW_SECONDS = 120
 DEFAULT_GATEWAY_RUNTIME_STATUS_FILE = "gateway_state.json"
 DEFAULT_GATEWAY_SESSIONS_DIR = "sessions"
 DEFAULT_GATEWAY_SESSIONS_INDEX = "sessions.json"
+DEFAULT_UPDATE_TIMEOUT_SECONDS = 3600
 BUSY_GATEWAY_STATES = {"starting", "draining", "stopping", "restarting"}
 _MANUAL_UPDATED_RE = re.compile(r"Installed:\s*(.+?)\s*$", re.IGNORECASE)
 
@@ -46,6 +49,7 @@ class UpdateStatus:
     local_head: str
     remote_head: str
     behind_count: int
+    ahead_count: int
     commit_lines: list[str]
 
 
@@ -406,6 +410,9 @@ def collect_update_status(
     behind_count = int(
         run_git(repo_root, "rev-list", f"HEAD..{remote}/{branch}", "--count").stdout.strip()
     )
+    ahead_count = int(
+        run_git(repo_root, "rev-list", f"{remote}/{branch}..HEAD", "--count").stdout.strip()
+    )
     commit_lines: list[str] = []
     if behind_count > 0:
         limit = str(min(behind_count, 10))
@@ -422,6 +429,7 @@ def collect_update_status(
         local_head=local_head,
         remote_head=remote_head,
         behind_count=behind_count,
+        ahead_count=ahead_count,
         commit_lines=commit_lines,
     )
 
@@ -454,6 +462,7 @@ def run_hermes_command(
     repo_root: Path,
     hermes_home: Path,
     *args: str,
+    timeout_seconds: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["HERMES_HOME"] = str(hermes_home)
@@ -461,13 +470,79 @@ def run_hermes_command(
     for key, value in env_values.items():
         env.setdefault(key, value)
     cmd = resolve_hermes_command(repo_root, *args)
-    return subprocess.run(
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return subprocess.run(
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    windows = os.name == "nt"
+    proc = subprocess.Popen(
         cmd,
         cwd=repo_root,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         env=env,
+        start_new_session=not windows,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        if windows:
+            proc.kill()
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            if windows:
+                proc.kill()
+            else:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            stdout, stderr = proc.communicate()
+        message = f"Hermes command timed out after {timeout_seconds}s: {' '.join(cmd)}"
+        stderr = "\n".join(text for text in [stderr, message] if text)
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr)
+
+
+def run_pip_check(
+    repo_root: Path,
+    hermes_home: Path,
+    *,
+    timeout_seconds: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(hermes_home)
+    env_values = load_simple_env(hermes_home / ".env")
+    for key, value in env_values.items():
+        env.setdefault(key, value)
+    cmd = [resolve_hermes_python(repo_root), "-m", "pip", "check"]
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        message = f"pip check timed out after {timeout_seconds}s"
+        stderr = "\n".join(text for text in [stderr, message] if text)
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr)
 
 
 def run_hermes_python(
@@ -490,8 +565,18 @@ def run_hermes_python(
     )
 
 
-def run_update(repo_root: Path, hermes_home: Path) -> subprocess.CompletedProcess[str]:
-    return run_hermes_command(repo_root, hermes_home, "update")
+def run_update(
+    repo_root: Path,
+    hermes_home: Path,
+    *,
+    timeout_seconds: int,
+) -> subprocess.CompletedProcess[str]:
+    return run_hermes_command(
+        repo_root,
+        hermes_home,
+        "update",
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def send_discord_message(channel_id: str, token: str, message: str) -> None:
@@ -1287,7 +1372,37 @@ def format_worktree_deferred(profile_name: str, worktree_status: WorktreeStatus)
     lines.extend(f"- {line}" for line in worktree_status.lines[:10])
     if len(worktree_status.lines) > 10:
         lines.append(f"- ... 외 {len(worktree_status.lines) - 10}개")
+    lines.extend(
+        [
+            "",
+            "권장 조치:",
+            "- 필요한 로컬 패치는 커밋하거나 upstream에 반영한 뒤 다시 실행하세요.",
+            "- 임시 변경이라면 사용자가 직접 stash/정리한 뒤 업데이트하세요.",
+            "- 이 보류를 끄면 hermes update의 stash/restore 충돌로 로컬 패치가 적용되지 않은 상태로 실행될 수 있습니다.",
+        ]
+    )
     return "\n".join(lines)
+
+
+def format_local_commits_deferred(profile_name: str, status: UpdateStatus) -> str:
+    return "\n".join(
+        [
+            "Hermes 일일 자동 업데이트 결과",
+            "상태: 업데이트 보류",
+            f"프로필: {profile_name}",
+            f"호스트: {socket.gethostname()}",
+            f"시각(UTC): {_now_utc()}",
+            "보류 기준: hermes-agent 브랜치에 upstream에 없는 로컬 커밋이 있음",
+            f"로컬 전용 커밋 수: {status.ahead_count}",
+            f"현재 HEAD: {_short_sha(status.local_head)}",
+            f"upstream HEAD: {_short_sha(status.remote_head)}",
+            "",
+            "권장 조치:",
+            "- 필요한 변경은 upstream PR/merge 또는 운영용 브랜치 정책으로 정리하세요.",
+            "- 임시 로컬 커밋이면 사용자가 직접 백업한 뒤 upstream과 맞추세요.",
+            "- 이 상태에서 자동 업데이트를 진행하면 merge/rebase 충돌로 gateway 코드가 예측하기 어려워질 수 있습니다.",
+        ]
+    )
 
 
 def format_no_update(profile_name: str, status: UpdateStatus, *, skill_updates_checked: bool) -> str:
@@ -1318,6 +1433,9 @@ def run_once(config: dict[str, Any]) -> int:
         )
     )
     defer_if_repo_dirty = bool(config.get("defer_if_repo_dirty", DEFAULT_DEFER_IF_REPO_DIRTY))
+    defer_if_local_commits = bool(
+        config.get("defer_if_local_commits", DEFAULT_DEFER_IF_LOCAL_COMMITS)
+    )
     recent_session_window_seconds = max(
         0,
         _safe_int(
@@ -1325,6 +1443,13 @@ def run_once(config: dict[str, Any]) -> int:
                 "recent_session_window_seconds",
                 DEFAULT_RECENT_SESSION_WINDOW_SECONDS,
             )
+            or 0
+        ),
+    )
+    update_timeout_seconds = max(
+        0,
+        _safe_int(
+            config.get("update_timeout_seconds", DEFAULT_UPDATE_TIMEOUT_SECONDS)
             or 0
         ),
     )
@@ -1420,8 +1545,24 @@ def run_once(config: dict[str, Any]) -> int:
     repo_updated = False
     status_after = status_before
 
+    if defer_if_local_commits and status_before.ahead_count > 0:
+        send_discord_message(
+            channel_id,
+            discord_token,
+            format_local_commits_deferred(profile_name, status_before),
+        )
+        print(
+            f"Deferred update because hermes-agent has {status_before.ahead_count} local commit(s) "
+            f"not present on {remote}/{branch}"
+        )
+        return 0
+
     if status_before.behind_count > 0:
-        update_proc = run_update(repo_root, hermes_home)
+        update_proc = run_update(
+            repo_root,
+            hermes_home,
+            timeout_seconds=update_timeout_seconds,
+        )
         update_output = "\n".join(filter(None, [update_proc.stdout, update_proc.stderr]))
         if update_proc.returncode != 0:
             send_discord_message(
@@ -1436,6 +1577,22 @@ def run_once(config: dict[str, Any]) -> int:
             )
             print(update_output or "Update failed.", file=sys.stderr)
             return update_proc.returncode or 1
+
+        pip_check_proc = run_pip_check(repo_root, hermes_home)
+        pip_check_output = "\n".join(filter(None, [pip_check_proc.stdout, pip_check_proc.stderr]))
+        if pip_check_proc.returncode != 0:
+            send_discord_message(
+                channel_id,
+                discord_token,
+                format_update_failure(
+                    status_before,
+                    profile_name,
+                    pip_check_output,
+                    failure_stage="Python 환경 검증",
+                ),
+            )
+            print(pip_check_output or "Python environment check failed.", file=sys.stderr)
+            return pip_check_proc.returncode or 1
 
         status_after = collect_update_status(repo_root, remote=remote, branch=branch)
         repo_updated = True

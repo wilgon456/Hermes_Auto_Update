@@ -92,5 +92,137 @@ class GatewayActivityTimezoneTests(unittest.TestCase):
         self.assertIsNone(parsed)
 
 
+class HermesCommandTimeoutTests(unittest.TestCase):
+    def test_run_hermes_command_times_out_and_terminates_process_group(self):
+        class FakeProcess:
+            pid = 12345
+            returncode = None
+
+            def __init__(self):
+                self.calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise hermes_update_auto.subprocess.TimeoutExpired(
+                        cmd=["hermes", "update"],
+                        timeout=timeout,
+                    )
+                self.returncode = -15
+                return "out", "err"
+
+        fake_proc = FakeProcess()
+
+        with (
+            TemporaryDirectory() as tmp,
+            patch("hermes_update_auto.resolve_hermes_command", return_value=["hermes", "update"]),
+            patch("hermes_update_auto.load_simple_env", return_value={}),
+            patch("hermes_update_auto.subprocess.Popen", return_value=fake_proc) as popen,
+            patch("hermes_update_auto.os.killpg") as killpg,
+        ):
+            result = hermes_update_auto.run_hermes_command(
+                Path(tmp),
+                Path(tmp),
+                "update",
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("timed out after 1s", result.stderr)
+        killpg.assert_called_once_with(12345, hermes_update_auto.signal.SIGTERM)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_run_hermes_command_timeout_kills_stubborn_process_group(self):
+        class FakeProcess:
+            pid = 23456
+            returncode = None
+
+            def communicate(self, timeout=None):
+                if timeout is not None:
+                    raise hermes_update_auto.subprocess.TimeoutExpired(
+                        cmd=["hermes", "update"],
+                        timeout=timeout,
+                    )
+                self.returncode = -9
+                return "", ""
+
+        with (
+            TemporaryDirectory() as tmp,
+            patch("hermes_update_auto.resolve_hermes_command", return_value=["hermes", "update"]),
+            patch("hermes_update_auto.load_simple_env", return_value={}),
+            patch("hermes_update_auto.subprocess.Popen", return_value=FakeProcess()),
+            patch("hermes_update_auto.os.killpg") as killpg,
+        ):
+            result = hermes_update_auto.run_hermes_command(
+                Path(tmp),
+                Path(tmp),
+                "update",
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                ((23456, hermes_update_auto.signal.SIGTERM),),
+                ((23456, hermes_update_auto.signal.SIGKILL),),
+            ],
+        )
+
+
+class UpdateSafetyTests(unittest.TestCase):
+    def test_worktree_deferred_message_warns_against_stash_restore_conflicts(self):
+        message = hermes_update_auto.format_worktree_deferred(
+            "main",
+            hermes_update_auto.WorktreeStatus(
+                dirty=True,
+                lines=["M gateway/run.py"],
+            ),
+        )
+
+        self.assertIn("권장 조치", message)
+        self.assertIn("upstream", message)
+        self.assertIn("stash/restore 충돌", message)
+
+    def test_run_pip_check_timeout_returns_failure_result(self):
+        with (
+            TemporaryDirectory() as tmp,
+            patch("hermes_update_auto.resolve_hermes_python", return_value="/venv/bin/python"),
+            patch("hermes_update_auto.load_simple_env", return_value={}),
+            patch("hermes_update_auto.subprocess.run") as run,
+        ):
+            run.side_effect = hermes_update_auto.subprocess.TimeoutExpired(
+                cmd=["/venv/bin/python", "-m", "pip", "check"],
+                timeout=1,
+                output="",
+                stderr="",
+            )
+
+            result = hermes_update_auto.run_pip_check(
+                Path(tmp),
+                Path(tmp),
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("pip check timed out after 1s", result.stderr)
+
+    def test_local_commits_deferred_message_warns_against_divergence(self):
+        message = hermes_update_auto.format_local_commits_deferred(
+            "main",
+            hermes_update_auto.UpdateStatus(
+                local_head="abcdef123456",
+                remote_head="123456abcdef",
+                behind_count=0,
+                ahead_count=2,
+                commit_lines=[],
+            ),
+        )
+
+        self.assertIn("로컬 전용 커밋 수: 2", message)
+        self.assertIn("upstream에 없는 로컬 커밋", message)
+        self.assertIn("merge/rebase 충돌", message)
+
+
 if __name__ == "__main__":
     unittest.main()

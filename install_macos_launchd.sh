@@ -53,6 +53,7 @@ cat > "${PLIST_PATH}" <<EOF
 EOF
 
 launchctl bootout "gui/$(id -u)" "${PLIST_PATH}" >/dev/null 2>&1 || true
+launchctl enable "gui/$(id -u)/ai.hermes.daily-repo-update"
 launchctl bootstrap "gui/$(id -u)" "${PLIST_PATH}"
 
 echo "Installed launchd job:"

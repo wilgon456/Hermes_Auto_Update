@@ -53,8 +53,10 @@
   "auto_update_custom_skills": true,
   "auto_discover_manual_public_skills": true,
   "defer_if_repo_dirty": true,
+  "defer_if_local_commits": true,
   "defer_if_recent_gateway_activity": true,
   "recent_session_window_seconds": 120,
+  "update_timeout_seconds": 3600,
   "tracked_public_skills_manifest": "/absolute/path/to/tracked-public-skills.json",
   "notify_on_no_update": false
 }
@@ -73,8 +75,10 @@ Windows 예시는 다음과 같습니다.
   "auto_update_custom_skills": true,
   "auto_discover_manual_public_skills": true,
   "defer_if_repo_dirty": true,
+  "defer_if_local_commits": true,
   "defer_if_recent_gateway_activity": true,
   "recent_session_window_seconds": 120,
+  "update_timeout_seconds": 3600,
   "tracked_public_skills_manifest": "C:\\Users\\you\\hermes-update-auto\\tracked-public-skills.json",
   "notify_on_no_update": false
 }
@@ -98,6 +102,11 @@ Windows 예시는 다음과 같습니다.
   기본값은 `true`입니다.
   `hermes-agent` 워크트리에 추적된 로컬 변경이 있으면 업데이트를 보류합니다.
   untracked 파일은 보류 기준에서 제외합니다.
+  운영 환경에서는 `true`를 권장합니다. `false`로 끄면 `hermes update`의 stash/restore 충돌 시 로컬 패치가 적용되지 않은 상태로 gateway가 다시 실행될 수 있습니다.
+- `defer_if_local_commits`
+  기본값은 `true`입니다.
+  현재 브랜치에 upstream에 없는 로컬 커밋이 있으면 업데이트를 보류합니다.
+  로컬 패치가 커밋된 뒤에도 upstream과 diverge된 상태에서 자동 merge/rebase가 일어나는 것을 막기 위한 보호 장치입니다.
 - `defer_if_recent_gateway_activity`
   기본값은 `true`입니다.
   Hermes gateway 상태 파일, platform update timestamp, session index를 보고 최근 활동이 감지되면 이번 실행의 업데이트를 보류합니다.
@@ -105,6 +114,9 @@ Windows 예시는 다음과 같습니다.
 - `recent_session_window_seconds`
   기본값은 `120`초입니다.
   최근 session activity로 간주할 시간 창입니다.
+- `update_timeout_seconds`
+  기본값은 `3600`초입니다.
+  `hermes update`가 이 시간을 넘기면 하위 프로세스 그룹을 종료하고 실패로 보고합니다.
 - `notify_on_no_update`
   변경이 없어도 Discord에 `상태: 업데이트 없음` 메시지를 보낼지 결정합니다.
 
