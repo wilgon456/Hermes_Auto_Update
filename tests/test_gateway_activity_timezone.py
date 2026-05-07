@@ -223,6 +223,58 @@ class UpdateSafetyTests(unittest.TestCase):
         self.assertIn("upstream에 없는 로컬 커밋", message)
         self.assertIn("merge/rebase 충돌", message)
 
+    def test_registered_local_overlay_matches_all_current_dirty_paths(self):
+        overlays = hermes_update_auto.load_local_overlays(
+            {
+                "local_overlays": [
+                    {
+                        "id": "discord-channel-model-bindings",
+                        "paths": [
+                            "gateway/platforms/discord.py",
+                            "gateway/run.py",
+                            "tests/gateway/test_discord_channel_controls.py",
+                            "tests/gateway/test_discord_channel_models.py",
+                        ],
+                    }
+                ]
+            }
+        )
+        status = hermes_update_auto.WorktreeStatus(
+            dirty=True,
+            lines=[
+                " M gateway/platforms/discord.py",
+                " M gateway/run.py",
+                " M tests/gateway/test_discord_channel_controls.py",
+                "?? tests/gateway/test_discord_channel_models.py",
+            ],
+        )
+
+        active, unknown = hermes_update_auto.match_local_overlays(status, overlays)
+
+        self.assertEqual([overlay.overlay_id for overlay in active], ["discord-channel-model-bindings"])
+        self.assertEqual(unknown, [])
+
+    def test_local_overlay_deferred_when_unknown_path_is_mixed_in(self):
+        overlays = hermes_update_auto.load_local_overlays(
+            {
+                "local_overlays": [
+                    {
+                        "id": "discord-channel-model-bindings",
+                        "paths": ["gateway/run.py"],
+                    }
+                ]
+            }
+        )
+        status = hermes_update_auto.WorktreeStatus(
+            dirty=True,
+            lines=[" M gateway/run.py", " M pyproject.toml"],
+        )
+
+        active, unknown = hermes_update_auto.match_local_overlays(status, overlays)
+
+        self.assertEqual([overlay.overlay_id for overlay in active], ["discord-channel-model-bindings"])
+        self.assertEqual(unknown, ["pyproject.toml"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -111,6 +112,24 @@ class GatewayActivityStatus:
 class WorktreeStatus:
     dirty: bool
     lines: list[str]
+
+
+@dataclass
+class LocalOverlay:
+    overlay_id: str
+    description: str
+    paths: list[str]
+    tests: list[str]
+    required: bool
+
+
+@dataclass
+class OverlayStashState:
+    active_overlays: list[LocalOverlay]
+    snapshot_dir: Path
+    stash_ref: str
+    stash_sha: str
+    stash_output: str
 
 
 class AlreadyRunningError(RuntimeError):
@@ -393,9 +412,268 @@ def run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def collect_worktree_status(repo_root: Path) -> WorktreeStatus:
-    proc = run_git(repo_root, "status", "--porcelain", "--untracked-files=no")
-    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    proc = run_git(repo_root, "status", "--porcelain", "--untracked-files=all")
+    lines = [line.rstrip() for line in proc.stdout.splitlines() if line.strip()]
     return WorktreeStatus(dirty=bool(lines), lines=lines)
+
+
+def _status_paths(line: str) -> list[str]:
+    """Extract path(s) from a git porcelain v1 status line."""
+    payload = line[3:].strip() if len(line) > 3 else line.strip()
+    if " -> " in payload:
+        return [part.strip().strip('"') for part in payload.split(" -> ") if part.strip()]
+    return [payload.strip('"')] if payload else []
+
+
+def _normalize_overlay_path(path: str) -> str:
+    return path.strip().strip("/")
+
+
+def load_local_overlays(config: dict[str, Any]) -> list[LocalOverlay]:
+    raw_overlays = config.get("local_overlays") or config.get("managed_local_overlays") or []
+    overlays: list[LocalOverlay] = []
+    if not isinstance(raw_overlays, list):
+        return overlays
+    for index, raw in enumerate(raw_overlays):
+        if not isinstance(raw, dict):
+            continue
+        paths = [
+            _normalize_overlay_path(str(path))
+            for path in raw.get("paths", [])
+            if str(path).strip()
+        ]
+        if not paths:
+            continue
+        tests = [str(test).strip() for test in raw.get("tests", []) if str(test).strip()]
+        overlay_id = str(raw.get("id") or raw.get("name") or f"overlay-{index + 1}").strip()
+        overlays.append(
+            LocalOverlay(
+                overlay_id=overlay_id,
+                description=str(raw.get("description") or "").strip(),
+                paths=paths,
+                tests=tests,
+                required=bool(raw.get("required", True)),
+            )
+        )
+    return overlays
+
+
+def match_local_overlays(
+    worktree_status: WorktreeStatus,
+    overlays: list[LocalOverlay],
+) -> tuple[list[LocalOverlay], list[str]]:
+    changed_paths: set[str] = set()
+    for line in worktree_status.lines:
+        changed_paths.update(_normalize_overlay_path(path) for path in _status_paths(line))
+    if not changed_paths:
+        return [], []
+
+    active: list[LocalOverlay] = []
+    covered_paths: set[str] = set()
+    for overlay in overlays:
+        overlay_paths = set(overlay.paths)
+        if changed_paths & overlay_paths:
+            active.append(overlay)
+            covered_paths.update(overlay_paths)
+    unknown = sorted(changed_paths - covered_paths)
+    return active, unknown
+
+
+def create_overlay_snapshot(
+    repo_root: Path,
+    hermes_home: Path,
+    config: dict[str, Any],
+    worktree_status: WorktreeStatus,
+    active_overlays: list[LocalOverlay],
+) -> Path:
+    root = Path(
+        config.get(
+            "local_overlay_snapshot_dir",
+            str(hermes_home / "backups" / "hermes-update-overlays"),
+        )
+    ).expanduser().resolve()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    snapshot_dir = root / stamp
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    (snapshot_dir / "status-before.txt").write_text(
+        "\n".join(worktree_status.lines) + ("\n" if worktree_status.lines else ""),
+        encoding="utf-8",
+    )
+    for filename, args in {
+        "tracked.diff": ["diff", "--binary"],
+        "staged.diff": ["diff", "--cached", "--binary"],
+    }.items():
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        (snapshot_dir / filename).write_text(proc.stdout, encoding="utf-8")
+
+    untracked_root = snapshot_dir / "untracked-files"
+    for line in worktree_status.lines:
+        if not line.startswith("?? "):
+            continue
+        for rel in _status_paths(line):
+            src = repo_root / rel
+            if src.is_file():
+                dst = untracked_root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            elif src.is_dir():
+                dst = untracked_root / rel
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+
+    save_json(
+        snapshot_dir / "overlay-manifest.json",
+        {
+            "created_at_utc": _now_utc(),
+            "repo_root": str(repo_root),
+            "head": run_git(repo_root, "rev-parse", "HEAD").stdout.strip(),
+            "active_overlays": [overlay.overlay_id for overlay in active_overlays],
+            "status_lines": worktree_status.lines,
+        },
+    )
+    return snapshot_dir
+
+
+def stash_local_overlays(
+    repo_root: Path,
+    active_overlays: list[LocalOverlay],
+) -> tuple[str, str, str]:
+    paths: list[str] = []
+    for overlay in active_overlays:
+        for path in overlay.paths:
+            if path not in paths:
+                paths.append(path)
+    message = "hermes-update-auto managed overlays: " + ",".join(
+        overlay.overlay_id for overlay in active_overlays
+    )
+    before_sha = subprocess.run(
+        ["git", "rev-parse", "--verify", "stash@{0}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    proc = run_git(repo_root, "stash", "push", "-u", "-m", message, "--", *paths)
+    after_ref = "stash@{0}"
+    after_sha = subprocess.run(
+        ["git", "rev-parse", "--verify", after_ref],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if not after_sha or after_sha == before_sha:
+        raise RuntimeError("Managed local overlay stash was not created; refusing to touch an unrelated existing stash.")
+    return after_ref, after_sha, proc.stdout.strip()
+
+
+def _find_stash_ref_by_sha(repo_root: Path, sha: str) -> str:
+    proc = subprocess.run(
+        ["git", "stash", "list", "--format=%gd %H"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for line in proc.stdout.splitlines():
+        ref, _, candidate_sha = line.partition(" ")
+        if candidate_sha.strip() == sha:
+            return ref.strip()
+    return ""
+
+
+def restore_overlay_stash(repo_root: Path, state: OverlayStashState) -> subprocess.CompletedProcess[str]:
+    if not state.stash_sha:
+        return subprocess.CompletedProcess(
+            ["git", "stash", "apply"],
+            1,
+            "",
+            "Missing managed overlay stash SHA; refusing to pop an unrelated stash.",
+        )
+    apply_proc = subprocess.run(
+        ["git", "stash", "apply", "--index", state.stash_sha],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if apply_proc.returncode != 0:
+        return apply_proc
+    drop_ref = _find_stash_ref_by_sha(repo_root, state.stash_sha)
+    drop_output = ""
+    if drop_ref:
+        drop_proc = subprocess.run(
+            ["git", "stash", "drop", drop_ref],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        drop_output = "\n".join(filter(None, [drop_proc.stdout, drop_proc.stderr]))
+        if drop_proc.returncode != 0:
+            return subprocess.CompletedProcess(
+                apply_proc.args,
+                drop_proc.returncode,
+                "\n".join(filter(None, [apply_proc.stdout, drop_output])),
+                apply_proc.stderr,
+            )
+    else:
+        drop_output = "Managed overlay stash applied, but matching stash reflog entry was not found; leaving any unrelated stashes untouched."
+    return subprocess.CompletedProcess(
+        apply_proc.args,
+        0,
+        "\n".join(filter(None, [apply_proc.stdout, drop_output])),
+        apply_proc.stderr,
+    )
+
+
+def run_overlay_tests(
+    repo_root: Path,
+    hermes_home: Path,
+    overlays: list[LocalOverlay],
+    *,
+    timeout_seconds: int,
+) -> subprocess.CompletedProcess[str]:
+    commands: list[str] = []
+    for overlay in overlays:
+        for command in overlay.tests:
+            if command not in commands:
+                commands.append(command)
+    if not commands:
+        return subprocess.CompletedProcess(["local-overlay-tests"], 0, "", "")
+
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(hermes_home)
+    env_values = load_simple_env(hermes_home / ".env")
+    for key, value in env_values.items():
+        env.setdefault(key, value)
+
+    outputs: list[str] = []
+    for command in commands:
+        proc = subprocess.run(
+            command,
+            cwd=repo_root,
+            shell=True,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_seconds if timeout_seconds > 0 else None,
+        )
+        outputs.append(f"$ {command}\n{proc.stdout}{proc.stderr}")
+        if proc.returncode != 0:
+            return subprocess.CompletedProcess(
+                ["local-overlay-tests"],
+                proc.returncode,
+                "\n".join(outputs),
+                "",
+            )
+    return subprocess.CompletedProcess(["local-overlay-tests"], 0, "\n".join(outputs), "")
 
 
 def collect_update_status(
@@ -1258,6 +1536,8 @@ def format_success(
     status_after: UpdateStatus,
     profile_name: str,
     skill_status: SkillUpdateStatus,
+    overlay_state: OverlayStashState | None = None,
+    overlay_test_output: str = "",
 ) -> str:
     lines = [
         "Hermes 일일 자동 업데이트 결과",
@@ -1270,6 +1550,13 @@ def format_success(
         f"적용 공개 스킬 수: {skill_status.updated_count if skill_status.checked else 0}",
         f"HEAD: {_short_sha(status_before.local_head)} -> {_short_sha(status_after.local_head)}",
     ]
+    if overlay_state:
+        lines.append("")
+        lines.append("local overlay:")
+        lines.extend(f"- {overlay.overlay_id}: 재적용 성공" for overlay in overlay_state.active_overlays)
+        lines.append(f"보존 위치: {overlay_state.snapshot_dir}")
+        if overlay_test_output.strip():
+            lines.append("검증: overlay 테스트 통과")
     if status_before.commit_lines:
         lines.append("")
         lines.append("반영된 커밋:")
@@ -1278,6 +1565,8 @@ def format_success(
         lines.append("")
         lines.append("반영된 공개 스킬:")
         lines.extend(f"- {name}" for name in skill_status.updated_names[:10])
+    lines.append("")
+    lines.append("주의: live gateway는 자동 재시작하지 않았습니다. 적용하려면 별도 승인이 필요합니다.")
     return "\n".join(lines)
 
 
@@ -1365,7 +1654,7 @@ def format_worktree_deferred(profile_name: str, worktree_status: WorktreeStatus)
         f"프로필: {profile_name}",
         f"호스트: {socket.gethostname()}",
         f"시각(UTC): {_now_utc()}",
-        "보류 기준: hermes-agent 워크트리에 추적된 로컬 변경이 있음",
+        "보류 기준: hermes-agent 워크트리에 등록되지 않은 로컬 변경이 있음",
         "",
         "감지된 변경:",
     ]
@@ -1376,12 +1665,72 @@ def format_worktree_deferred(profile_name: str, worktree_status: WorktreeStatus)
         [
             "",
             "권장 조치:",
-            "- 필요한 로컬 패치는 커밋하거나 upstream에 반영한 뒤 다시 실행하세요.",
+            "- 계속 보존할 로컬 커스텀은 local_overlays에 등록하세요.",
             "- 임시 변경이라면 사용자가 직접 stash/정리한 뒤 업데이트하세요.",
-            "- 이 보류를 끄면 hermes update의 stash/restore 충돌로 로컬 패치가 적용되지 않은 상태로 실행될 수 있습니다.",
+            "- 등록되지 않은 변경은 의미/검증법을 모르므로 upstream 업데이트 후 자동 재적용하지 않습니다.",
+            "- 필요하면 local_overlays에 테스트와 함께 등록해 stash/restore 충돌을 검증하게 하세요.",
         ]
     )
     return "\n".join(lines)
+
+
+def format_local_overlay_deferred(
+    profile_name: str,
+    worktree_status: WorktreeStatus,
+    unknown_paths: list[str],
+    active_overlays: list[LocalOverlay],
+) -> str:
+    lines = [
+        "Hermes 일일 자동 업데이트 결과",
+        "상태: 업데이트 보류",
+        f"프로필: {profile_name}",
+        f"호스트: {socket.gethostname()}",
+        f"시각(UTC): {_now_utc()}",
+        "보류 기준: 등록된 local overlay 밖의 로컬 변경이 있음",
+        "",
+        "등록 인식된 overlay:",
+    ]
+    if active_overlays:
+        lines.extend(f"- {overlay.overlay_id}" for overlay in active_overlays)
+    else:
+        lines.append("- 없음")
+    lines.append("")
+    lines.append("미등록 변경 경로:")
+    lines.extend(f"- {path}" for path in unknown_paths[:10])
+    if len(unknown_paths) > 10:
+        lines.append(f"- ... 외 {len(unknown_paths) - 10}개")
+    lines.append("")
+    lines.append("전체 감지 변경:")
+    lines.extend(f"- {line}" for line in worktree_status.lines[:10])
+    return "\n".join(lines)
+
+
+def format_local_overlay_failure(
+    profile_name: str,
+    state: OverlayStashState,
+    output: str,
+    *,
+    failure_stage: str,
+) -> str:
+    return "\n".join(
+        [
+            "Hermes 일일 자동 업데이트 결과",
+            "상태: 업데이트 실패",
+            f"프로필: {profile_name}",
+            f"호스트: {socket.gethostname()}",
+            f"시각(UTC): {_now_utc()}",
+            "저장소: NousResearch/hermes-agent",
+            f"실패 단계: {failure_stage}",
+            "local overlay:",
+            *[f"- {overlay.overlay_id}" for overlay in state.active_overlays],
+            f"보존 위치: {state.snapshot_dir}",
+            "",
+            "최근 출력:",
+            tail_lines(output),
+            "",
+            "주의: live gateway는 자동 재시작하지 않았습니다.",
+        ]
+    )
 
 
 def format_local_commits_deferred(profile_name: str, status: UpdateStatus) -> str:
@@ -1493,6 +1842,11 @@ def run_once(config: dict[str, Any]) -> int:
             file=sys.stderr,
         )
 
+    overlay_state: OverlayStashState | None = None
+    overlay_test_output = ""
+    pending_overlay_status: WorktreeStatus | None = None
+    pending_overlays: list[LocalOverlay] = []
+
     if defer_if_repo_dirty:
         try:
             worktree_status = collect_worktree_status(repo_root)
@@ -1502,16 +1856,41 @@ def run_once(config: dict[str, Any]) -> int:
             print(output, file=sys.stderr)
             return 1
         if worktree_status.dirty:
-            send_discord_message(
-                channel_id,
-                discord_token,
-                format_worktree_deferred(profile_name, worktree_status),
-            )
+            overlays = load_local_overlays(config)
+            active_overlays, unknown_paths = match_local_overlays(worktree_status, overlays)
+            if not active_overlays:
+                send_discord_message(
+                    channel_id,
+                    discord_token,
+                    format_worktree_deferred(profile_name, worktree_status),
+                )
+                print(
+                    "Deferred update because hermes-agent has unregistered local changes: "
+                    + "; ".join(worktree_status.lines[:5])
+                )
+                return 0
+            if unknown_paths:
+                send_discord_message(
+                    channel_id,
+                    discord_token,
+                    format_local_overlay_deferred(
+                        profile_name,
+                        worktree_status,
+                        unknown_paths,
+                        active_overlays,
+                    ),
+                )
+                print(
+                    "Deferred update because hermes-agent has local changes outside registered overlays: "
+                    + "; ".join(unknown_paths[:5])
+                )
+                return 0
+            pending_overlay_status = worktree_status
+            pending_overlays = active_overlays
             print(
-                "Deferred update because hermes-agent has tracked local changes: "
-                + "; ".join(worktree_status.lines[:5])
+                "Recognized managed local overlay(s): "
+                + ", ".join(overlay.overlay_id for overlay in active_overlays)
             )
-            return 0
 
     if defer_if_recent_gateway_activity and recent_session_window_seconds > 0:
         blockers = detect_recent_gateway_activity(
@@ -1558,6 +1937,37 @@ def run_once(config: dict[str, Any]) -> int:
         return 0
 
     if status_before.behind_count > 0:
+        if pending_overlay_status and pending_overlays:
+            try:
+                snapshot_dir = create_overlay_snapshot(
+                    repo_root,
+                    hermes_home,
+                    config,
+                    pending_overlay_status,
+                    pending_overlays,
+                )
+                stash_ref, stash_sha, stash_output = stash_local_overlays(repo_root, pending_overlays)
+                overlay_state = OverlayStashState(
+                    active_overlays=pending_overlays,
+                    snapshot_dir=snapshot_dir,
+                    stash_ref=stash_ref,
+                    stash_sha=stash_sha,
+                    stash_output=stash_output,
+                )
+                print(
+                    "Stashed managed local overlay(s) before update: "
+                    + ", ".join(overlay.overlay_id for overlay in pending_overlays)
+                    + f"; snapshot={snapshot_dir}"
+                )
+            except Exception as exc:
+                if isinstance(exc, subprocess.CalledProcessError):
+                    output = "\n".join(filter(None, [exc.stdout, exc.stderr])) or str(exc)
+                else:
+                    output = str(exc)
+                send_discord_message(channel_id, discord_token, format_check_failure(profile_name, output))
+                print(output, file=sys.stderr)
+                return 1
+
         update_proc = run_update(
             repo_root,
             hermes_home,
@@ -1565,6 +1975,32 @@ def run_once(config: dict[str, Any]) -> int:
         )
         update_output = "\n".join(filter(None, [update_proc.stdout, update_proc.stderr]))
         if update_proc.returncode != 0:
+            if overlay_state:
+                restore_proc = restore_overlay_stash(repo_root, overlay_state)
+                restore_output = "\n".join(filter(None, [restore_proc.stdout, restore_proc.stderr]))
+                update_output = "\n".join(
+                    filter(
+                        None,
+                        [
+                            update_output,
+                            "Overlay restore after update failure:",
+                            restore_output,
+                        ],
+                    )
+                )
+                if restore_proc.returncode != 0:
+                    send_discord_message(
+                        channel_id,
+                        discord_token,
+                        format_local_overlay_failure(
+                            profile_name,
+                            overlay_state,
+                            update_output,
+                            failure_stage="update 실패 후 local overlay 복구",
+                        ),
+                    )
+                    print(update_output or "Update failed and local overlay restore failed.", file=sys.stderr)
+                    return restore_proc.returncode or 1
             send_discord_message(
                 channel_id,
                 discord_token,
@@ -1577,6 +2013,46 @@ def run_once(config: dict[str, Any]) -> int:
             )
             print(update_output or "Update failed.", file=sys.stderr)
             return update_proc.returncode or 1
+
+        if overlay_state:
+            restore_proc = restore_overlay_stash(repo_root, overlay_state)
+            restore_output = "\n".join(filter(None, [restore_proc.stdout, restore_proc.stderr]))
+            if restore_proc.returncode != 0:
+                send_discord_message(
+                    channel_id,
+                    discord_token,
+                    format_local_overlay_failure(
+                        profile_name,
+                        overlay_state,
+                        restore_output,
+                        failure_stage="local overlay 재적용",
+                    ),
+                )
+                print(restore_output or "Local overlay restore failed.", file=sys.stderr)
+                return restore_proc.returncode or 1
+
+            overlay_test_proc = run_overlay_tests(
+                repo_root,
+                hermes_home,
+                overlay_state.active_overlays,
+                timeout_seconds=max(60, min(update_timeout_seconds or 300, 600)),
+            )
+            overlay_test_output = "\n".join(
+                filter(None, [overlay_test_proc.stdout, overlay_test_proc.stderr])
+            )
+            if overlay_test_proc.returncode != 0:
+                send_discord_message(
+                    channel_id,
+                    discord_token,
+                    format_local_overlay_failure(
+                        profile_name,
+                        overlay_state,
+                        overlay_test_output,
+                        failure_stage="local overlay 검증",
+                    ),
+                )
+                print(overlay_test_output or "Local overlay tests failed.", file=sys.stderr)
+                return overlay_test_proc.returncode or 1
 
         pip_check_proc = run_pip_check(repo_root, hermes_home)
         pip_check_output = "\n".join(filter(None, [pip_check_proc.stdout, pip_check_proc.stderr]))
@@ -1699,7 +2175,14 @@ def run_once(config: dict[str, Any]) -> int:
     send_discord_message(
         channel_id,
         discord_token,
-        format_success(status_before, status_after, profile_name, combined_skill_status),
+        format_success(
+            status_before,
+            status_after,
+            profile_name,
+            combined_skill_status,
+            overlay_state=overlay_state,
+            overlay_test_output=overlay_test_output,
+        ),
     )
     summary_parts = []
     if repo_updated:
