@@ -10,7 +10,8 @@
 - `~/.hermes/skills` 아래의 수동 설치 스킬 중, 공개 소스에서 정확히 하나로 식별되는 경우 자동으로 추적 목록에 등록합니다.
 - 별도 manifest에 등록된 수동 설치 공개 스킬도 upstream 내용을 다시 확인해서 자동 갱신합니다.
 - 같은 repo/profile 조합에 대해 중복 실행이 감지되면 새 실행은 바로 종료합니다.
-- `hermes-agent` 워크트리에 추적된 로컬 변경이 있으면 업데이트를 보류합니다.
+- `hermes-agent` 워크트리에 로컬 변경이 있으면 기본적으로 업데이트를 보류합니다.
+- 등록된 `local_overlays`에 해당하는 로컬 커스텀 패치는 업데이트 전 snapshot/stash 후 자동 재적용하고 테스트합니다.
 - gateway가 최근에 활동 중인 것으로 보이면 업데이트를 보류합니다.
 - 저장소와 공개 스킬 모두 변경이 없으면 아무 작업도 하지 않습니다.
 - 결과를 Discord 채널에 한국어 메시지로 전송합니다.
@@ -33,9 +34,10 @@
 ## 공개 전 주의사항
 
 - 이 도구는 `hermes update`를 호출하므로, 실제 업데이트 시 Hermes gateway 재시작이나 manual gateway 종료가 일어날 수 있습니다.
-- 현재 기본 동작은 추적된 로컬 변경이나 최근 gateway 활동이 감지되면 업데이트를 보류하는 것입니다.
+- 현재 기본 동작은 로컬 변경이나 최근 gateway 활동이 감지되면 업데이트를 보류하는 것입니다. 단, 등록된 `local_overlays`만 변경된 경우에는 자동 보존/재적용을 시도합니다.
 - gateway 보류 판단은 `gateway_state.json`, 플랫폼 상태, `sessions/sessions.json` 기준입니다.
-- `hermes-agent`에 추적된 로컬 변경이 있으면 충돌을 피하기 위해 `hermes update`를 호출하지 않습니다.
+- `hermes-agent`에 미등록 로컬 변경이 있으면 충돌을 피하기 위해 `hermes update`를 호출하지 않습니다.
+- 공개 저장소에 넣는 overlay 예시는 반드시 일반화된 파일 경로와 테스트 명령만 담고, 개인 경로/계정/채널 ID/토큰은 넣지 마세요.
 - 공개 저장소에는 실제 `config.json`, 프로필 `.env`, Discord 토큰 같은 비밀값을 포함하면 안 됩니다.
 
 ## 설정
@@ -58,7 +60,23 @@
   "recent_session_window_seconds": 120,
   "update_timeout_seconds": 3600,
   "tracked_public_skills_manifest": "/absolute/path/to/tracked-public-skills.json",
-  "notify_on_no_update": false
+  "notify_on_no_update": false,
+  "local_overlay_snapshot_dir": "/absolute/path/to/.hermes/profiles/main/backups/hermes-update-overlays",
+  "local_overlays": [
+    {
+      "id": "my-local-runtime-patch",
+      "description": "Preserve a local-only runtime patch across upstream updates.",
+      "paths": [
+        "gateway/platforms/example.py",
+        "gateway/run.py",
+        "tests/gateway/test_example_runtime_patch.py"
+      ],
+      "tests": [
+        "venv/bin/python -m pytest -o addopts='' tests/gateway/test_example_runtime_patch.py -q"
+      ],
+      "required": true
+    }
+  ]
 }
 ```
 
@@ -80,7 +98,23 @@ Windows 예시는 다음과 같습니다.
   "recent_session_window_seconds": 120,
   "update_timeout_seconds": 3600,
   "tracked_public_skills_manifest": "C:\\Users\\you\\hermes-update-auto\\tracked-public-skills.json",
-  "notify_on_no_update": false
+  "notify_on_no_update": false,
+  "local_overlay_snapshot_dir": "C:\\Users\\you\\.hermes\\profiles\\main\\backups\\hermes-update-overlays",
+  "local_overlays": [
+    {
+      "id": "my-local-runtime-patch",
+      "description": "Preserve a local-only runtime patch across upstream updates.",
+      "paths": [
+        "gateway/platforms/example.py",
+        "gateway/run.py",
+        "tests/gateway/test_example_runtime_patch.py"
+      ],
+      "tests": [
+        "venv\\Scripts\\python.exe -m pytest -o addopts='' tests/gateway/test_example_runtime_patch.py -q"
+      ],
+      "required": true
+    }
+  ]
 }
 ```
 
@@ -100,9 +134,17 @@ Windows 예시는 다음과 같습니다.
   수동 설치 공개 스킬 추적 파일 경로입니다. 생략하면 `config.json` 옆의 `tracked-public-skills.json`을 사용합니다.
 - `defer_if_repo_dirty`
   기본값은 `true`입니다.
-  `hermes-agent` 워크트리에 추적된 로컬 변경이 있으면 업데이트를 보류합니다.
-  untracked 파일은 보류 기준에서 제외합니다.
+  `hermes-agent` 워크트리에 로컬 변경이 있으면 업데이트를 보류합니다.
+  단, 변경된 경로가 모두 `local_overlays`에 등록되어 있으면 업데이트 전 snapshot과 stash를 만들고, 업데이트 후 해당 overlay를 재적용한 뒤 overlay별 테스트를 실행합니다.
   운영 환경에서는 `true`를 권장합니다. `false`로 끄면 `hermes update`의 stash/restore 충돌 시 로컬 패치가 적용되지 않은 상태로 gateway가 다시 실행될 수 있습니다.
+- `local_overlay_snapshot_dir`
+  등록된 local overlay를 업데이트 전에 보존할 snapshot 디렉터리입니다.
+  snapshot에는 `git status`, tracked/staged diff, untracked 파일 복사본, overlay manifest가 들어갑니다.
+- `local_overlays`
+  업데이트 때 자동으로 보존/재적용할 로컬 커스텀 패치 목록입니다.
+  각 overlay는 `id`, `description`, `paths`, `tests`, `required`를 가질 수 있습니다.
+  dirty path가 등록된 overlay의 `paths` 밖에 하나라도 있으면 updater는 안전하게 보류합니다.
+  stash restore는 기존 stash index가 아니라 생성된 stash object SHA를 기준으로 apply/drop하므로, 기존 사용자 stash를 잘못 pop하지 않습니다.
 - `defer_if_local_commits`
   기본값은 `true`입니다.
   현재 브랜치에 upstream에 없는 로컬 커밋이 있으면 업데이트를 보류합니다.
@@ -155,6 +197,29 @@ hermes skills install <identifier> --force --yes
 ```
 
 그리고 manifest의 `state` 블록에 마지막 확인 시각, 마지막 적용 hash, probe 상태 등을 기록합니다.
+
+## Managed local overlays
+
+개인 또는 팀 환경에서 upstream에는 아직 없는 작은 런타임 패치를 유지해야 할 때 `local_overlays`를 사용합니다.
+
+동작 순서:
+
+1. `git status --porcelain --untracked-files=all`로 로컬 변경을 확인합니다.
+2. 변경된 모든 경로가 등록된 overlay의 `paths`에 포함되는지 확인합니다.
+3. 미등록 경로가 있으면 업데이트를 보류합니다.
+4. 등록된 overlay만 있으면 snapshot을 저장합니다.
+5. overlay 경로만 `git stash push -u`로 임시 보존합니다.
+6. `hermes update`를 실행합니다.
+7. 생성된 stash object SHA를 기준으로 overlay를 다시 적용하고 stash entry를 제거합니다.
+8. overlay의 `tests`를 실행합니다.
+9. 성공/실패를 Discord에 보고합니다.
+
+주의사항:
+
+- 이 기능은 로컬 커스텀 패치를 보존하기 위한 것이며, 비밀값이나 개인 설정 파일을 공개 repo에 넣기 위한 기능이 아닙니다.
+- `paths`에는 repo 상대 경로만 넣으세요.
+- `tests`에는 공개적으로 공유해도 되는 일반 명령만 넣으세요.
+- gateway 재시작은 이 updater가 직접 수행하지 않습니다. 업데이트 성공 후 실제 서비스에 반영하려면 별도 운영 절차로 재시작하세요.
 
 ## 자동 발견 규칙
 
