@@ -1,6 +1,6 @@
-# hermes update auto
+# Hermes Auto Update
 
-로컬 `hermes-agent` 체크아웃을 매일 점검해서 자동 업데이트하는 외부 업데이터입니다.
+공식 `hermes-agent` 저장소를 직접 수정하지 않고, 로컬 체크아웃을 매일 점검해서 안전하게 업데이트하는 외부 업데이터입니다. 개인 커스텀을 유지하면서 upstream 변경을 따라가야 하는 환경을 목표로 합니다.
 
 ## 주요 기능
 
@@ -12,6 +12,9 @@
 - 같은 repo/profile 조합에 대해 중복 실행이 감지되면 새 실행은 바로 종료합니다.
 - `hermes-agent` 워크트리에 로컬 변경이 있으면 기본적으로 업데이트를 보류합니다.
 - 등록된 `local_overlays`에 해당하는 로컬 커스텀 패치는 업데이트 전 snapshot/stash 후 자동 재적용하고 테스트합니다.
+- `defer_if_local_commits: false`인 경우 upstream과 로컬 커밋이 갈라져도 백업 브랜치와 patch 백업을 만든 뒤 upstream 위에 로컬 커밋을 `git am --3way`로 재적용합니다.
+- 로컬 커밋 재적용 중 충돌이 나면 원래 HEAD로 rollback하고, 충돌 파일/백업 브랜치/패치 백업 위치를 보고합니다.
+- `codex_conflict_handoff.enabled`가 켜져 있으면 충돌 rollback 후 `codex exec`를 한 번 호출해서 복구 작업을 이어받게 하고, handoff prompt/output/last-message를 파일로 남깁니다.
 - gateway가 최근에 활동 중인 것으로 보이면 업데이트를 보류합니다.
 - 저장소와 공개 스킬 모두 변경이 없으면 아무 작업도 하지 않습니다.
 - 결과를 Discord 채널에 한국어 메시지로 전송합니다.
@@ -31,14 +34,14 @@
 - Windows: Task Scheduler 설치 스크립트 제공
 - Linux: 실행 자체는 가능하지만 전용 설치 스크립트는 아직 없으므로 cron/systemd timer는 수동 구성 기준입니다.
 
-## 공개 전 주의사항
+## 안전 주의사항
 
 - 이 도구는 `hermes update`를 호출하므로, 실제 업데이트 시 Hermes gateway 재시작이나 manual gateway 종료가 일어날 수 있습니다.
 - 현재 기본 동작은 로컬 변경이나 최근 gateway 활동이 감지되면 업데이트를 보류하는 것입니다. 단, 등록된 `local_overlays`만 변경된 경우에는 자동 보존/재적용을 시도합니다.
 - gateway 보류 판단은 `gateway_state.json`, 플랫폼 상태, `sessions/sessions.json` 기준입니다.
 - `hermes-agent`에 미등록 로컬 변경이 있으면 충돌을 피하기 위해 `hermes update`를 호출하지 않습니다.
-- 공개 저장소에 넣는 overlay 예시는 반드시 일반화된 파일 경로와 테스트 명령만 담고, 개인 경로/계정/채널 ID/토큰은 넣지 마세요.
-- 공개 저장소에는 실제 `config.json`, 프로필 `.env`, Discord 토큰 같은 비밀값을 포함하면 안 됩니다.
+- 이 저장소에는 실제 `config.json`, 프로필 `.env`, Discord 토큰, 채널 ID 같은 비밀값을 포함하면 안 됩니다.
+- `config.example.json`에는 일반화된 예시만 두고, 개인 경로/계정/채널 ID/토큰은 각자의 로컬 `config.json`에만 보관하세요.
 
 ## 설정
 
@@ -55,12 +58,28 @@
   "auto_update_custom_skills": true,
   "auto_discover_manual_public_skills": true,
   "defer_if_repo_dirty": true,
+  "ignored_worktree_paths": [],
+  "ignored_untracked_paths": [
+    "plans/**"
+  ],
   "defer_if_local_commits": true,
   "defer_if_recent_gateway_activity": true,
   "recent_session_window_seconds": 120,
   "update_timeout_seconds": 3600,
   "tracked_public_skills_manifest": "/absolute/path/to/tracked-public-skills.json",
   "notify_on_no_update": false,
+  "local_commit_backup_dir": "/absolute/path/to/.hermes/profiles/main/backups/hermes-update-local-commits",
+  "local_commit_backup_keep": 10,
+  "codex_conflict_handoff": {
+    "enabled": false,
+    "command": "codex",
+    "timeout_seconds": 7200,
+    "sandbox": "workspace-write",
+    "approval": "never",
+    "model": "",
+    "extra_args": [],
+    "log_dir": "/absolute/path/to/.hermes/profiles/main/backups/hermes-update-codex-handoff"
+  },
   "local_overlay_snapshot_dir": "/absolute/path/to/.hermes/profiles/main/backups/hermes-update-overlays",
   "local_overlays": [
     {
@@ -93,12 +112,28 @@ Windows 예시는 다음과 같습니다.
   "auto_update_custom_skills": true,
   "auto_discover_manual_public_skills": true,
   "defer_if_repo_dirty": true,
+  "ignored_worktree_paths": [],
+  "ignored_untracked_paths": [
+    "plans/**"
+  ],
   "defer_if_local_commits": true,
   "defer_if_recent_gateway_activity": true,
   "recent_session_window_seconds": 120,
   "update_timeout_seconds": 3600,
   "tracked_public_skills_manifest": "C:\\Users\\you\\hermes-update-auto\\tracked-public-skills.json",
   "notify_on_no_update": false,
+  "local_commit_backup_dir": "C:\\Users\\you\\.hermes\\profiles\\main\\backups\\hermes-update-local-commits",
+  "local_commit_backup_keep": 10,
+  "codex_conflict_handoff": {
+    "enabled": false,
+    "command": "codex",
+    "timeout_seconds": 7200,
+    "sandbox": "workspace-write",
+    "approval": "never",
+    "model": "",
+    "extra_args": [],
+    "log_dir": "C:\\Users\\you\\.hermes\\profiles\\main\\backups\\hermes-update-codex-handoff"
+  },
   "local_overlay_snapshot_dir": "C:\\Users\\you\\.hermes\\profiles\\main\\backups\\hermes-update-overlays",
   "local_overlays": [
     {
@@ -137,6 +172,9 @@ Windows 예시는 다음과 같습니다.
   `hermes-agent` 워크트리에 로컬 변경이 있으면 업데이트를 보류합니다.
   단, 변경된 경로가 모두 `local_overlays`에 등록되어 있으면 업데이트 전 snapshot과 stash를 만들고, 업데이트 후 해당 overlay를 재적용한 뒤 overlay별 테스트를 실행합니다.
   운영 환경에서는 `true`를 권장합니다. `false`로 끄면 `hermes update`의 stash/restore 충돌 시 로컬 패치가 적용되지 않은 상태로 gateway가 다시 실행될 수 있습니다.
+- `ignored_worktree_paths`, `ignored_untracked_paths`
+  dirty check에서 무시할 repo 상대 경로 패턴입니다. `plans/**`처럼 자동 업데이트와 무관한 산출물 디렉터리를 넣을 수 있습니다.
+  `ignored_worktree_paths`는 tracked/untracked 모두에 적용되고, `ignored_untracked_paths`는 `??` untracked 항목에만 적용됩니다.
 - `local_overlay_snapshot_dir`
   등록된 local overlay를 업데이트 전에 보존할 snapshot 디렉터리입니다.
   snapshot에는 `git status`, tracked/staged diff, untracked 파일 복사본, overlay manifest가 들어갑니다.
@@ -148,7 +186,22 @@ Windows 예시는 다음과 같습니다.
 - `defer_if_local_commits`
   기본값은 `true`입니다.
   현재 브랜치에 upstream에 없는 로컬 커밋이 있으면 업데이트를 보류합니다.
-  로컬 패치가 커밋된 뒤에도 upstream과 diverge된 상태에서 자동 merge/rebase가 일어나는 것을 막기 위한 보호 장치입니다.
+  `false`로 설정하면 upstream 업데이트가 있을 때 다음 순서로 로컬 커밋을 자동 재적용합니다.
+  1. `backup/hermes-auto-update-<timestamp>` 백업 브랜치를 만듭니다.
+  2. `local_commit_backup_dir` 아래에 `format-patch` 결과를 저장합니다.
+  3. checkout을 `origin/main`으로 `reset --hard`합니다.
+  4. 저장된 patch를 `git am --3way`로 하나씩 적용합니다.
+  5. 충돌이 나면 `git am --abort` 후 백업 브랜치로 rollback하고 충돌 파일을 보고합니다.
+  upstream에서 이미 온 merge commit은 안전하게 제외하고, 실제 로컬 merge commit은 `format-patch`로 의도를 보존하기 어렵기 때문에 자동 재적용하지 않고 보류합니다.
+- `local_commit_backup_dir`, `local_commit_backup_keep`
+  로컬 커밋 자동 재적용 전 생성하는 patch 백업 디렉터리와 보존 개수입니다.
+  기본 위치는 `~/.hermes/profiles/<profile>/backups/hermes-update-local-commits`이며 기본 보존 개수는 10입니다.
+- `codex_conflict_handoff`
+  로컬 커밋 자동 재적용 충돌 후 Codex CLI에게 복구를 넘기는 선택 기능입니다.
+  `enabled: true`이면 updater가 먼저 안전 rollback을 끝낸 뒤 `codex exec`를 호출합니다.
+  기본 명령은 `codex exec --cd <repo> --add-dir <patch-backup-dir> --sandbox workspace-write --ask-for-approval never` 형태입니다.
+  결과는 `log_dir/<timestamp>/prompt.md`, `codex-output.log`, `codex-last-message.md`에 저장됩니다.
+  일반 배포 예시는 `false`를 권장합니다. headless Codex가 로컬 repo를 수정할 수 있으므로, 본인이 사용하는 단일 머신/프로필에서만 켜세요.
 - `defer_if_recent_gateway_activity`
   기본값은 `true`입니다.
   Hermes gateway 상태 파일, platform update timestamp, session index를 보고 최근 활동이 감지되면 이번 실행의 업데이트를 보류합니다.

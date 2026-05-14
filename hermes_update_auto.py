@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -112,6 +113,7 @@ class GatewayActivityStatus:
 class WorktreeStatus:
     dirty: bool
     lines: list[str]
+    ignored_lines: list[str] | None = None
 
 
 @dataclass
@@ -132,12 +134,78 @@ class OverlayStashState:
     stash_output: str
 
 
+@dataclass
+class LocalCommitSyncResult:
+    timestamp: str
+    backup_branch: str
+    backup_dir: Path
+    patch_files: list[Path]
+    applied_patches: list[Path]
+
+
+class LocalCommitSyncBlocked(RuntimeError):
+    def __init__(self, reason: str, details: str = "") -> None:
+        super().__init__(details or reason)
+        self.reason = reason
+        self.details = details
+
+
+class LocalCommitSyncConflict(RuntimeError):
+    def __init__(
+        self,
+        *,
+        timestamp: str,
+        backup_branch: str,
+        backup_dir: Path,
+        patch_file: Path,
+        patch_subject: str,
+        conflicted_files: list[str],
+        output: str,
+    ) -> None:
+        super().__init__(output)
+        self.timestamp = timestamp
+        self.backup_branch = backup_branch
+        self.backup_dir = backup_dir
+        self.patch_file = patch_file
+        self.patch_subject = patch_subject
+        self.conflicted_files = conflicted_files
+
+
+class LocalCommitSyncUnexpected(RuntimeError):
+    def __init__(
+        self,
+        *,
+        timestamp: str,
+        backup_branch: str,
+        backup_dir: Path,
+        output: str,
+    ) -> None:
+        super().__init__(output)
+        self.timestamp = timestamp
+        self.backup_branch = backup_branch
+        self.backup_dir = backup_dir
+
+
+@dataclass
+class CodexHandoffResult:
+    attempted: bool
+    returncode: int
+    handoff_dir: Path
+    prompt_file: Path
+    output_file: Path
+    last_message_file: Path
+
+
 class AlreadyRunningError(RuntimeError):
     """Raised when another updater instance already holds the run lock."""
 
 
 def _now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _timestamp_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
 def _short_sha(sha: str) -> str:
@@ -411,10 +479,64 @@ def run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def run_git_no_check(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def collect_worktree_status(repo_root: Path) -> WorktreeStatus:
     proc = run_git(repo_root, "status", "--porcelain", "--untracked-files=all")
     lines = [line.rstrip() for line in proc.stdout.splitlines() if line.strip()]
     return WorktreeStatus(dirty=bool(lines), lines=lines)
+
+
+def _path_matches_pattern(path: str, pattern: str) -> bool:
+    normalized_path = _normalize_overlay_path(path)
+    normalized_pattern = _normalize_overlay_path(pattern)
+    if not normalized_pattern:
+        return False
+    if normalized_pattern.endswith("/**"):
+        prefix = normalized_pattern[:-3].rstrip("/")
+        return normalized_path == prefix or normalized_path.startswith(prefix + "/")
+    if normalized_pattern.endswith("/"):
+        prefix = normalized_pattern.rstrip("/")
+        return normalized_path == prefix or normalized_path.startswith(prefix + "/")
+    return fnmatch.fnmatch(normalized_path, normalized_pattern)
+
+
+def _line_is_untracked(line: str) -> bool:
+    return line.startswith("?? ")
+
+
+def filter_ignored_worktree_status(
+    worktree_status: WorktreeStatus,
+    *,
+    ignored_worktree_paths: list[str],
+    ignored_untracked_paths: list[str],
+) -> WorktreeStatus:
+    if not worktree_status.lines:
+        return worktree_status
+
+    kept: list[str] = []
+    ignored: list[str] = []
+    for line in worktree_status.lines:
+        paths = [_normalize_overlay_path(path) for path in _status_paths(line)]
+        patterns = list(ignored_worktree_paths)
+        if _line_is_untracked(line):
+            patterns.extend(ignored_untracked_paths)
+        if paths and all(
+            any(_path_matches_pattern(path, pattern) for pattern in patterns)
+            for path in paths
+        ):
+            ignored.append(line)
+        else:
+            kept.append(line)
+    return WorktreeStatus(dirty=bool(kept), lines=kept, ignored_lines=ignored)
 
 
 def _status_paths(line: str) -> list[str]:
@@ -712,6 +834,200 @@ def collect_update_status(
     )
 
 
+def git_state_dir(repo_root: Path) -> Path:
+    git_dir = run_git(repo_root, "rev-parse", "--git-dir").stdout.strip()
+    path = Path(git_dir)
+    if not path.is_absolute():
+        path = repo_root / path
+    return path
+
+
+def in_progress_git_operation(repo_root: Path) -> str:
+    git_dir = git_state_dir(repo_root)
+    markers = {
+        "rebase-apply": "git am/rebase apply",
+        "rebase-merge": "git rebase",
+        "MERGE_HEAD": "git merge",
+        "CHERRY_PICK_HEAD": "git cherry-pick",
+        "REVERT_HEAD": "git revert",
+    }
+    for marker, label in markers.items():
+        if (git_dir / marker).exists():
+            return label
+    return ""
+
+
+def read_patch_subject(patch_file: Path) -> str:
+    for line in patch_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("Subject: "):
+            subject = re.sub(r"^Subject:\s*(?:\[PATCH[^\]]*\]\s*)?", "", line).strip()
+            return subject or patch_file.name
+    return patch_file.name
+
+
+def patch_files_in_order(backup_dir: Path) -> list[Path]:
+    return sorted(backup_dir.glob("*.patch"))
+
+
+def local_commit_backup_root(config: dict[str, Any], hermes_home: Path) -> Path:
+    return Path(
+        config.get(
+            "local_commit_backup_dir",
+            str(hermes_home / "backups" / "hermes-update-local-commits"),
+        )
+    ).expanduser().resolve()
+
+
+def prune_old_local_commit_backups(
+    repo_root: Path,
+    hermes_home: Path,
+    config: dict[str, Any],
+) -> None:
+    keep = max(1, int(config.get("local_commit_backup_keep", 10) or 10))
+    base_dir = local_commit_backup_root(config, hermes_home)
+    if base_dir.exists():
+        dirs = sorted([path for path in base_dir.iterdir() if path.is_dir()], key=lambda p: p.name)
+        for old_dir in dirs[:-keep]:
+            shutil.rmtree(old_dir, ignore_errors=True)
+
+    branches = run_git_no_check(repo_root, "branch", "--list", "backup/hermes-auto-update-*")
+    if branches.returncode != 0:
+        return
+    names = sorted(
+        line.strip().lstrip("* ").strip()
+        for line in branches.stdout.splitlines()
+        if line.strip()
+    )
+    for branch_name in names[:-keep]:
+        run_git_no_check(repo_root, "branch", "-D", branch_name)
+
+
+def run_local_commit_sync(
+    repo_root: Path,
+    hermes_home: Path,
+    config: dict[str, Any],
+    *,
+    remote: str,
+    branch: str,
+) -> LocalCommitSyncResult:
+    operation = in_progress_git_operation(repo_root)
+    if operation:
+        raise LocalCommitSyncBlocked(
+            "git 작업이 이미 진행 중입니다.",
+            f"{operation} 상태가 남아 있습니다. 수동으로 완료 또는 abort 후 다시 실행하세요.",
+        )
+
+    merge_commits = run_git_no_check(
+        repo_root,
+        "rev-list",
+        "--merges",
+        "--parents",
+        f"{remote}/{branch}..HEAD",
+    )
+    if merge_commits.returncode != 0:
+        output = "\n".join(filter(None, [merge_commits.stdout, merge_commits.stderr]))
+        raise LocalCommitSyncBlocked("로컬 merge commit 확인 실패", output)
+    blocked_merges: list[str] = []
+    dropped_upstream_merges: list[str] = []
+    for line in merge_commits.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        commit = parts[0]
+        non_first_parents = parts[2:]
+        all_upstream = True
+        for parent in non_first_parents:
+            ancestor = run_git_no_check(repo_root, "merge-base", "--is-ancestor", parent, f"{remote}/{branch}")
+            if ancestor.returncode != 0:
+                all_upstream = False
+                break
+        if all_upstream:
+            dropped_upstream_merges.append(commit)
+        else:
+            blocked_merges.append(commit)
+    if blocked_merges:
+        raise LocalCommitSyncBlocked(
+            "로컬 merge commit은 자동 재적용하지 않습니다.",
+            "\n".join(blocked_merges),
+        )
+
+    timestamp = _timestamp_utc()
+    backup_branch = f"backup/hermes-auto-update-{timestamp}"
+    backup_dir = local_commit_backup_root(config, hermes_home) / timestamp
+    backup_dir.mkdir(parents=True, exist_ok=False)
+
+    run_git(repo_root, "branch", "-f", backup_branch, "HEAD")
+    run_git(repo_root, "format-patch", "--no-merges", f"{remote}/{branch}..HEAD", "-o", str(backup_dir))
+    patch_files = patch_files_in_order(backup_dir)
+    if dropped_upstream_merges:
+        (backup_dir / "dropped-upstream-merge-commits.txt").write_text(
+            "\n".join(dropped_upstream_merges) + "\n",
+            encoding="utf-8",
+        )
+
+    applied: list[Path] = []
+    did_reset = False
+    try:
+        run_git(repo_root, "fetch", remote)
+        run_git(repo_root, "reset", "--hard", f"{remote}/{branch}")
+        did_reset = True
+        for patch_file in patch_files:
+            proc = run_git_no_check(repo_root, "am", "--3way", str(patch_file))
+            if proc.returncode != 0:
+                conflicted = [
+                    line.strip()
+                    for line in run_git_no_check(
+                        repo_root,
+                        "diff",
+                        "--name-only",
+                        "--diff-filter=U",
+                    ).stdout.splitlines()
+                    if line.strip()
+                ]
+                output = "\n".join(filter(None, [proc.stdout, proc.stderr])) or str(patch_file)
+                run_git_no_check(repo_root, "am", "--abort")
+                run_git(repo_root, "reset", "--hard", backup_branch)
+                raise LocalCommitSyncConflict(
+                    timestamp=timestamp,
+                    backup_branch=backup_branch,
+                    backup_dir=backup_dir,
+                    patch_file=patch_file,
+                    patch_subject=read_patch_subject(patch_file),
+                    conflicted_files=conflicted,
+                    output=output,
+                )
+            applied.append(patch_file)
+    except LocalCommitSyncConflict:
+        raise
+    except Exception as exc:
+        if did_reset:
+            try:
+                run_git_no_check(repo_root, "am", "--abort")
+                run_git(repo_root, "reset", "--hard", backup_branch)
+            except Exception as rollback_exc:
+                raise LocalCommitSyncUnexpected(
+                    timestamp=timestamp,
+                    backup_branch=backup_branch,
+                    backup_dir=backup_dir,
+                    output=f"{exc}\nRollback failed: {rollback_exc}",
+                ) from rollback_exc
+        raise LocalCommitSyncUnexpected(
+            timestamp=timestamp,
+            backup_branch=backup_branch,
+            backup_dir=backup_dir,
+            output=str(exc),
+        ) from exc
+
+    prune_old_local_commit_backups(repo_root, hermes_home, config)
+    return LocalCommitSyncResult(
+        timestamp=timestamp,
+        backup_branch=backup_branch,
+        backup_dir=backup_dir,
+        patch_files=patch_files,
+        applied_patches=applied,
+    )
+
+
 def resolve_hermes_command(repo_root: Path, *args: str) -> list[str]:
     windows = os.name == "nt"
     candidates = [
@@ -828,19 +1144,30 @@ def run_hermes_python(
     hermes_home: Path,
     code: str,
     payload: dict[str, Any],
+    *,
+    timeout_seconds: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["HERMES_HOME"] = str(hermes_home)
     env_values = load_simple_env(hermes_home / ".env")
     for key, value in env_values.items():
         env.setdefault(key, value)
-    return subprocess.run(
-        [resolve_hermes_python(repo_root), "-c", code, json.dumps(payload, ensure_ascii=False)],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    cmd = [resolve_hermes_python(repo_root), "-c", code, json.dumps(payload, ensure_ascii=False)]
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_seconds if timeout_seconds and timeout_seconds > 0 else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        message = f"Hermes maintenance timed out after {timeout_seconds}s"
+        stderr = "\n".join(text for text in [stderr, message] if text)
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr)
 
 
 def run_update(
@@ -855,6 +1182,305 @@ def run_update(
         "update",
         timeout_seconds=timeout_seconds,
     )
+
+
+def run_post_git_maintenance(
+    repo_root: Path,
+    hermes_home: Path,
+    *,
+    timeout_seconds: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run the non-git side effects normally performed by `hermes update`.
+
+    The auto-updater owns git synchronization when local commits are replayed.
+    Calling `hermes update` after that would run a second, competing git update
+    path. This maintenance step keeps dependencies/config/skills current without
+    touching branch history.
+    """
+
+    code = r"""
+from pathlib import Path
+import importlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+payload = json.loads(sys.argv[1])
+repo = Path(payload["repo_root"])
+
+import hermes_cli.main as main
+
+print("→ Running post-git Hermes maintenance...")
+main._invalidate_update_cache()
+
+removed = main._clear_bytecode_cache(repo)
+if removed:
+    print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
+
+print("→ Updating Python dependencies...")
+uv_bin = main.shutil.which("uv")
+if uv_bin:
+    uv_env = {**os.environ, "VIRTUAL_ENV": str(repo / "venv")}
+    main._install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env)
+else:
+    pip_cmd = [sys.executable, "-m", "pip"]
+    try:
+        subprocess.run(pip_cmd + ["--version"], cwd=repo, check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"], cwd=repo, check=True)
+    main._install_python_dependencies_with_optional_fallback(pip_cmd)
+
+main._update_node_dependencies()
+
+try:
+    import hermes_constants as _hc
+    importlib.reload(_hc)
+except Exception:
+    pass
+
+try:
+    from tools.skills_sync import sync_skills
+    print()
+    print("→ Syncing bundled skills...")
+    result = sync_skills(quiet=True)
+    if result["copied"]:
+        print(f"  + {len(result['copied'])} new: {', '.join(result['copied'])}")
+    if result.get("updated"):
+        print(f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}")
+    if result.get("user_modified"):
+        print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
+    if result.get("cleaned"):
+        print(f"  - {len(result['cleaned'])} removed from manifest")
+    if not result["copied"] and not result.get("updated"):
+        print("  ✓ Skills are up to date")
+except Exception as exc:
+    print(f"  ⚠ Skills sync skipped: {exc}")
+
+try:
+    from hermes_cli.profiles import list_profiles, seed_profile_skills
+    all_profiles = list_profiles()
+    if all_profiles:
+        print()
+        print("→ Syncing bundled skills to all profiles...")
+        for p in all_profiles:
+            try:
+                r = seed_profile_skills(p.path, quiet=True)
+                if r and r.get("skipped_opt_out"):
+                    status = "opted out (--no-skills)"
+                elif r:
+                    copied = len(r.get("copied", []))
+                    updated = len(r.get("updated", []))
+                    modified = len(r.get("user_modified", []))
+                    parts = []
+                    if copied:
+                        parts.append(f"+{copied} new")
+                    if updated:
+                        parts.append(f"↑{updated} updated")
+                    if modified:
+                        parts.append(f"~{modified} user-modified")
+                    status = ", ".join(parts) if parts else "up to date"
+                else:
+                    status = "sync failed"
+                print(f"  {p.name}: {status}")
+            except Exception as exc:
+                print(f"  {p.name}: error ({exc})")
+except Exception:
+    pass
+
+try:
+    from plugins.memory.honcho.cli import sync_honcho_profiles_quiet
+    synced = sync_honcho_profiles_quiet()
+    if synced:
+        print(f"\n-> Honcho: synced {synced} profile(s)")
+except Exception:
+    pass
+
+print()
+print("→ Checking configuration for new options...")
+from hermes_cli.config import (
+    check_config_version,
+    get_missing_config_fields,
+    get_missing_env_vars,
+    migrate_config,
+)
+
+missing_env = get_missing_env_vars(required_only=True)
+missing_config = get_missing_config_fields()
+current_ver, latest_ver = check_config_version()
+if missing_env or missing_config or current_ver < latest_ver:
+    print("  ℹ Non-interactive session - applying safe config migrations.")
+    migrate_config(interactive=False, quiet=False)
+    if missing_env:
+        print("  ℹ API keys require manual entry: hermes config migrate")
+else:
+    print("  ✓ Configuration is up to date")
+
+print()
+print("✓ Post-git Hermes maintenance complete!")
+"""
+    return run_hermes_python(
+        repo_root,
+        hermes_home,
+        code,
+        {"repo_root": str(repo_root)},
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def codex_handoff_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("codex_conflict_handoff", {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def build_codex_conflict_prompt(
+    *,
+    repo_root: Path,
+    remote: str,
+    branch: str,
+    profile_name: str,
+    exc: LocalCommitSyncConflict,
+    restore_output: str,
+) -> str:
+    files = "\n".join(f"- {name}" for name in exc.conflicted_files) if exc.conflicted_files else "- (unknown)"
+    return f"""Hermes auto-update conflict handoff.
+
+Goal:
+Resolve the failed auto-update for this local Hermes checkout. The official upstream repository is read-only for this user. Do not push, open PRs, or upload anything to upstream.
+
+Repository:
+- repo_root: {repo_root}
+- upstream remote/branch: {remote}/{branch}
+- profile: {profile_name}
+
+Auto-updater state:
+- backup branch restored before this handoff: {exc.backup_branch}
+- patch backup directory: {exc.backup_dir}
+- failed patch file: {exc.patch_file}
+- failed patch subject: {exc.patch_subject}
+
+Conflicted files reported by git am:
+{files}
+
+Overlay restore output, if any:
+{restore_output or "(none)"}
+
+Required behavior:
+1. Inspect the current repo state first.
+2. Preserve the user's local customizations.
+3. Treat {remote}/{branch} as read-only upstream.
+4. Re-attempt the update by applying the patch files from the backup directory onto {remote}/{branch}, resolving conflicts conservatively.
+5. Do not use git push.
+6. Run focused tests for touched areas when feasible.
+7. If you cannot resolve safely, leave the repository on the restored backup branch/state and write a clear report with the blocker and next commands.
+8. If you resolve successfully, leave the repository in a clean or intentionally documented state and summarize commits/files/tests.
+"""
+
+
+def run_codex_conflict_handoff(
+    repo_root: Path,
+    hermes_home: Path,
+    config: dict[str, Any],
+    *,
+    remote: str,
+    branch: str,
+    profile_name: str,
+    exc: LocalCommitSyncConflict,
+    restore_output: str = "",
+) -> CodexHandoffResult | None:
+    handoff_cfg = codex_handoff_config(config)
+    if not bool(handoff_cfg.get("enabled", False)):
+        return None
+
+    codex_bin = str(handoff_cfg.get("command", "codex")).strip() or "codex"
+    timeout_seconds = max(60, int(handoff_cfg.get("timeout_seconds", 7200) or 7200))
+    model = str(handoff_cfg.get("model", "")).strip()
+    sandbox = str(handoff_cfg.get("sandbox", "workspace-write")).strip() or "workspace-write"
+    approval = str(handoff_cfg.get("approval", "never")).strip() or "never"
+    extra_args = [str(arg) for arg in handoff_cfg.get("extra_args", []) if str(arg).strip()]
+
+    handoff_root = Path(
+        handoff_cfg.get(
+            "log_dir",
+            str(hermes_home / "backups" / "hermes-update-codex-handoff"),
+        )
+    ).expanduser().resolve()
+    handoff_dir = handoff_root / exc.timestamp
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    prompt_file = handoff_dir / "prompt.md"
+    output_file = handoff_dir / "codex-output.log"
+    last_message_file = handoff_dir / "codex-last-message.md"
+
+    prompt = build_codex_conflict_prompt(
+        repo_root=repo_root,
+        remote=remote,
+        branch=branch,
+        profile_name=profile_name,
+        exc=exc,
+        restore_output=restore_output,
+    )
+    prompt_file.write_text(prompt, encoding="utf-8")
+
+    cmd = [
+        codex_bin,
+        "exec",
+        "--cd",
+        str(repo_root),
+        "--add-dir",
+        str(exc.backup_dir),
+        "--sandbox",
+        sandbox,
+        "--ask-for-approval",
+        approval,
+        "--output-last-message",
+        str(last_message_file),
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    cmd.extend(extra_args)
+    cmd.append(prompt)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        output_file.write_text(
+            "\n".join(filter(None, [proc.stdout, proc.stderr])),
+            encoding="utf-8",
+        )
+        return CodexHandoffResult(
+            attempted=True,
+            returncode=proc.returncode,
+            handoff_dir=handoff_dir,
+            prompt_file=prompt_file,
+            output_file=output_file,
+            last_message_file=last_message_file,
+        )
+    except subprocess.TimeoutExpired as timeout:
+        stdout = timeout.stdout if isinstance(timeout.stdout, str) else ""
+        stderr = timeout.stderr if isinstance(timeout.stderr, str) else ""
+        output_file.write_text(
+            "\n".join(
+                filter(
+                    None,
+                    [stdout, stderr, f"Codex handoff timed out after {timeout_seconds}s"],
+                )
+            ),
+            encoding="utf-8",
+        )
+        return CodexHandoffResult(
+            attempted=True,
+            returncode=124,
+            handoff_dir=handoff_dir,
+            prompt_file=prompt_file,
+            output_file=output_file,
+            last_message_file=last_message_file,
+        )
 
 
 def send_discord_message(channel_id: str, token: str, message: str) -> None:
@@ -875,12 +1501,15 @@ def send_discord_message(channel_id: str, token: str, message: str) -> None:
     try:
         with request.urlopen(req, timeout=30) as resp:
             if resp.status not in (200, 201):
-                raise RuntimeError(f"Discord API returned HTTP {resp.status}")
+                print(
+                    f"Discord notification failed: HTTP {resp.status}",
+                    file=sys.stderr,
+                )
     except error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Discord API error {exc.code}: {body}") from exc
+        print(f"Discord notification failed: HTTP {exc.code}: {body}", file=sys.stderr)
     except error.URLError as exc:
-        raise RuntimeError(f"Discord connection failed: {exc}") from exc
+        print(f"Discord notification failed: {exc}", file=sys.stderr)
 
 
 def tail_lines(text: str, max_lines: int = 20) -> str:
@@ -1538,6 +2167,7 @@ def format_success(
     skill_status: SkillUpdateStatus,
     overlay_state: OverlayStashState | None = None,
     overlay_test_output: str = "",
+    local_commit_sync: LocalCommitSyncResult | None = None,
 ) -> str:
     lines = [
         "Hermes 일일 자동 업데이트 결과",
@@ -1557,6 +2187,12 @@ def format_success(
         lines.append(f"보존 위치: {overlay_state.snapshot_dir}")
         if overlay_test_output.strip():
             lines.append("검증: overlay 테스트 통과")
+    if local_commit_sync:
+        lines.append("")
+        lines.append("로컬 커밋 재적용:")
+        lines.append(f"- 재적용 커밋 수: {len(local_commit_sync.applied_patches)}")
+        lines.append(f"- 백업 브랜치: {local_commit_sync.backup_branch}")
+        lines.append(f"- 패치 백업: {local_commit_sync.backup_dir}")
     if status_before.commit_lines:
         lines.append("")
         lines.append("반영된 커밋:")
@@ -1591,6 +2227,77 @@ def format_update_failure(
             "",
             "최근 업데이트 출력:",
             tail_lines(output),
+        ]
+    )
+
+
+def format_local_commit_sync_blocked(profile_name: str, reason: str, details: str = "") -> str:
+    lines = [
+        "Hermes 일일 자동 업데이트 결과",
+        "상태: 로컬 커밋 자동 재적용 보류",
+        f"프로필: {profile_name}",
+        f"호스트: {socket.gethostname()}",
+        f"시각(UTC): {_now_utc()}",
+        "저장소: NousResearch/hermes-agent",
+        f"이유: {reason}",
+    ]
+    if details:
+        lines.extend(["", "상세:", tail_lines(details)])
+    lines.extend(
+        [
+            "",
+            "권장 조치:",
+            "- merge commit이나 진행 중인 git 작업은 자동 재적용하지 않습니다.",
+            "- 수동으로 git 상태를 정리한 뒤 다음 자동 업데이트를 기다리거나 updater를 다시 실행하세요.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_local_commit_sync_conflict(
+    profile_name: str,
+    exc: LocalCommitSyncConflict,
+) -> str:
+    files = "\n".join(f"- {name}" for name in exc.conflicted_files) if exc.conflicted_files else "- (확인 불가)"
+    return "\n".join(
+        [
+            "Hermes 일일 자동 업데이트 결과",
+            "상태: 로컬 커밋 자동 재적용 충돌",
+            f"프로필: {profile_name}",
+            f"호스트: {socket.gethostname()}",
+            f"시각(UTC): {_now_utc()}",
+            "저장소: NousResearch/hermes-agent",
+            f"동기화 타임스탬프: {exc.timestamp}",
+            f"실패한 패치: {exc.patch_subject}",
+            "",
+            "충돌 파일:",
+            files,
+            "",
+            f"복구된 백업 브랜치: {exc.backup_branch}",
+            f"패치 백업: {exc.backup_dir}",
+            "수동 복구 힌트: 백업 브랜치에서 시작해 패치 파일을 하나씩 `git am --3way`로 적용하고 충돌을 해결하세요.",
+        ]
+    )
+
+
+def format_local_commit_sync_unexpected(
+    profile_name: str,
+    exc: LocalCommitSyncUnexpected,
+) -> str:
+    return "\n".join(
+        [
+            "Hermes 일일 자동 업데이트 결과",
+            "상태: 로컬 커밋 자동 재적용 실패",
+            f"프로필: {profile_name}",
+            f"호스트: {socket.gethostname()}",
+            f"시각(UTC): {_now_utc()}",
+            "저장소: NousResearch/hermes-agent",
+            f"동기화 타임스탬프: {exc.timestamp}",
+            f"복구된 백업 브랜치: {exc.backup_branch}",
+            f"패치 백업: {exc.backup_dir}",
+            "",
+            "최근 출력:",
+            tail_lines(str(exc)),
         ]
     )
 
@@ -1782,6 +2489,16 @@ def run_once(config: dict[str, Any]) -> int:
         )
     )
     defer_if_repo_dirty = bool(config.get("defer_if_repo_dirty", DEFAULT_DEFER_IF_REPO_DIRTY))
+    ignored_worktree_paths = [
+        str(path).strip()
+        for path in config.get("ignored_worktree_paths", [])
+        if str(path).strip()
+    ]
+    ignored_untracked_paths = [
+        str(path).strip()
+        for path in config.get("ignored_untracked_paths", [])
+        if str(path).strip()
+    ]
     defer_if_local_commits = bool(
         config.get("defer_if_local_commits", DEFAULT_DEFER_IF_LOCAL_COMMITS)
     )
@@ -1844,12 +2561,18 @@ def run_once(config: dict[str, Any]) -> int:
 
     overlay_state: OverlayStashState | None = None
     overlay_test_output = ""
+    local_commit_sync_result: LocalCommitSyncResult | None = None
     pending_overlay_status: WorktreeStatus | None = None
     pending_overlays: list[LocalOverlay] = []
 
     if defer_if_repo_dirty:
         try:
             worktree_status = collect_worktree_status(repo_root)
+            worktree_status = filter_ignored_worktree_status(
+                worktree_status,
+                ignored_worktree_paths=ignored_worktree_paths,
+                ignored_untracked_paths=ignored_untracked_paths,
+            )
         except subprocess.CalledProcessError as exc:
             output = "\n".join(filter(None, [exc.stdout, exc.stderr])) or str(exc)
             send_discord_message(channel_id, discord_token, format_check_failure(profile_name, output))
@@ -1968,11 +2691,86 @@ def run_once(config: dict[str, Any]) -> int:
                 print(output, file=sys.stderr)
                 return 1
 
-        update_proc = run_update(
-            repo_root,
-            hermes_home,
-            timeout_seconds=update_timeout_seconds,
-        )
+        if status_before.ahead_count > 0:
+            try:
+                local_commit_sync_result = run_local_commit_sync(
+                    repo_root,
+                    hermes_home,
+                    config,
+                    remote=remote,
+                    branch=branch,
+                )
+                print(
+                    "Replayed local commit(s) after upstream sync: "
+                    f"{len(local_commit_sync_result.applied_patches)} patch(es); "
+                    f"backup={local_commit_sync_result.backup_branch}"
+                )
+            except LocalCommitSyncBlocked as exc:
+                restore_output = ""
+                if overlay_state:
+                    restore_proc = restore_overlay_stash(repo_root, overlay_state)
+                    restore_output = "\n".join(filter(None, [restore_proc.stdout, restore_proc.stderr]))
+                message = format_local_commit_sync_blocked(
+                    profile_name,
+                    exc.reason,
+                    "\n".join(filter(None, [exc.details, restore_output])),
+                )
+                send_discord_message(channel_id, discord_token, message)
+                print(message, file=sys.stderr)
+                return 1
+            except LocalCommitSyncConflict as exc:
+                restore_output = ""
+                if overlay_state:
+                    restore_proc = restore_overlay_stash(repo_root, overlay_state)
+                    restore_output = "\n".join(filter(None, [restore_proc.stdout, restore_proc.stderr]))
+                message = format_local_commit_sync_conflict(profile_name, exc)
+                if restore_output:
+                    message += "\n\nlocal overlay 복구 출력:\n" + tail_lines(restore_output)
+                handoff = run_codex_conflict_handoff(
+                    repo_root,
+                    hermes_home,
+                    config,
+                    remote=remote,
+                    branch=branch,
+                    profile_name=profile_name,
+                    exc=exc,
+                    restore_output=restore_output,
+                )
+                if handoff:
+                    message += "\n\nCodex handoff:"
+                    message += f"\n- returncode: {handoff.returncode}"
+                    message += f"\n- handoff dir: {handoff.handoff_dir}"
+                    message += f"\n- output: {handoff.output_file}"
+                    message += f"\n- last message: {handoff.last_message_file}"
+                send_discord_message(channel_id, discord_token, message)
+                print(message, file=sys.stderr)
+                return 1
+            except LocalCommitSyncUnexpected as exc:
+                restore_output = ""
+                if overlay_state:
+                    restore_proc = restore_overlay_stash(repo_root, overlay_state)
+                    restore_output = "\n".join(filter(None, [restore_proc.stdout, restore_proc.stderr]))
+                message = format_local_commit_sync_unexpected(profile_name, exc)
+                if restore_output:
+                    message += "\n\nlocal overlay 복구 출력:\n" + tail_lines(restore_output)
+                send_discord_message(channel_id, discord_token, message)
+                print(message, file=sys.stderr)
+                return 1
+
+        if local_commit_sync_result:
+            update_proc = run_post_git_maintenance(
+                repo_root,
+                hermes_home,
+                timeout_seconds=update_timeout_seconds,
+            )
+            update_stage = "Hermes post-git maintenance"
+        else:
+            update_proc = run_update(
+                repo_root,
+                hermes_home,
+                timeout_seconds=update_timeout_seconds,
+            )
+            update_stage = "Hermes 코드 업데이트"
         update_output = "\n".join(filter(None, [update_proc.stdout, update_proc.stderr]))
         if update_proc.returncode != 0:
             if overlay_state:
@@ -2008,7 +2806,7 @@ def run_once(config: dict[str, Any]) -> int:
                     status_before,
                     profile_name,
                     update_output,
-                    failure_stage="Hermes 코드 업데이트",
+                    failure_stage=update_stage,
                 ),
             )
             print(update_output or "Update failed.", file=sys.stderr)
@@ -2182,6 +2980,7 @@ def run_once(config: dict[str, Any]) -> int:
             combined_skill_status,
             overlay_state=overlay_state,
             overlay_test_output=overlay_test_output,
+            local_commit_sync=local_commit_sync_result,
         ),
     )
     summary_parts = []
@@ -2189,6 +2988,10 @@ def run_once(config: dict[str, Any]) -> int:
         summary_parts.append(
             f"repo {_short_sha(status_before.local_head)} -> {_short_sha(status_after.local_head)} "
             f"({status_before.behind_count} commits)"
+        )
+    if local_commit_sync_result:
+        summary_parts.append(
+            f"{len(local_commit_sync_result.applied_patches)} local commit patch(es) replayed"
         )
     if combined_skill_status.updated_count:
         summary_parts.append(f"{combined_skill_status.updated_count} public skill(s)")

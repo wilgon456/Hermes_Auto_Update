@@ -8,25 +8,40 @@
   "auto_update_custom_skills": true,
   "auto_discover_manual_public_skills": true,
   "defer_if_repo_dirty": true,
+  "ignored_worktree_paths": [],
+  "ignored_untracked_paths": [
+    "plans/**"
+  ],
   "defer_if_local_commits": true,
   "defer_if_recent_gateway_activity": true,
   "recent_session_window_seconds": 120,
   "update_timeout_seconds": 3600,
   "tracked_public_skills_manifest": "/absolute/path/to/tracked-public-skills.json",
   "notify_on_no_update": false,
+  "local_commit_backup_dir": "/absolute/path/to/.hermes/profiles/main/backups/hermes-update-local-commits",
+  "local_commit_backup_keep": 10,
+  "codex_conflict_handoff": {
+    "enabled": false,
+    "command": "codex",
+    "timeout_seconds": 7200,
+    "sandbox": "workspace-write",
+    "approval": "never",
+    "model": "",
+    "extra_args": [],
+    "log_dir": "/absolute/path/to/.hermes/profiles/main/backups/hermes-update-codex-handoff"
+  },
   "local_overlay_snapshot_dir": "/absolute/path/to/.hermes/profiles/main/backups/hermes-update-overlays",
   "local_overlays": [
     {
-      "id": "discord-channel-model-bindings",
-      "description": "Preserve local Discord channel/thread model binding runtime patch across Hermes upstream updates.",
+      "id": "my-local-runtime-patch",
+      "description": "Preserve a local-only runtime patch across upstream updates.",
       "paths": [
-        "gateway/platforms/discord.py",
+        "gateway/platforms/example.py",
         "gateway/run.py",
-        "tests/gateway/test_discord_channel_controls.py",
-        "tests/gateway/test_discord_channel_models.py"
+        "tests/gateway/test_example_runtime_patch.py"
       ],
       "tests": [
-        "venv/bin/python -m pytest -o addopts='' tests/gateway/test_discord_channel_controls.py tests/gateway/test_discord_channel_models.py -q"
+        "venv/bin/python -m pytest -o addopts='' tests/gateway/test_example_runtime_patch.py -q"
       ],
       "required": true
     }
